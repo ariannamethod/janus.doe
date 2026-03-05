@@ -67,7 +67,7 @@ no `--depth` flag? DOE checks your hardware and picks the deepest model that fit
 
 dim = depth * 64 (cap 768). head_dim = 64. GQA above 384. hidden = 1.5x per expert.
 
-## when you run it, DEO:
+## when you run it, DOE:
 
 1. **auto-sizes** to hardware (RAM, CPUs, GPU detection)
 2. **scans environment** — finds GGUFs, checks resources, detects compiler/curl
