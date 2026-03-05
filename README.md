@@ -1,8 +1,8 @@
-# m.c — Democracy of Experts
+# m.c — DeO: Democracy of Experts
 
 one file. 3348 lines. pure C. zero dependencies. living MoE that breeds, kills, and votes.
 
-## what is this
+## what
 
 a transformer where experts are born, die, and hold elections:
 
@@ -18,11 +18,11 @@ a transformer where experts are born, die, and hold elections:
 
 **parameters persist. topology doesn't.** each forward pass decides how many experts are alive, how many vote, how deep to go. same weights, different architecture every time.
 
-**v2: the organism is autonomous.** DOE scans its environment, attaches to nearby GGUFs via LoRA (symbiont mode), hunts for datasets on HuggingFace, recognizes code in training data, finds its own weights on restart, and can replicate itself via `fork()`.
+DOE scans its environment, attaches to nearby GGUFs via LoRA (symbiont mode), hunts for datasets on HuggingFace, recognizes code in training data, finds its own weights on restart, and can replicate itself via `fork()`.
 
 no pytorch. no python. no dignity.
 
-## quick start
+## how
 
 ```bash
 # compile
@@ -49,7 +49,7 @@ cc m.c -O3 -lm -lpthread -DUSE_BLAS -lopenblas -o m                            #
 ./m --personality personality.txt
 ```
 
-## auto depth
+## autodepth
 
 no `--depth` flag? DOE checks your hardware and picks the deepest model that fits:
 
@@ -65,7 +65,7 @@ no `--depth` flag? DOE checks your hardware and picks the deepest model that fit
 
 dim = depth * 64 (cap 768). head_dim = 64. GQA above 384. hidden = 1.5x per expert.
 
-## what happens when you run it
+## when you run it, DEO:
 
 1. **auto-sizes** to hardware (RAM, CPUs, GPU detection)
 2. **scans environment** — finds GGUFs, checks resources, detects compiler/curl
@@ -84,7 +84,7 @@ dim = depth * 64 (cap 768). head_dim = 64. GQA above 384. hidden = 1.5x per expe
 15. finetunes on `personality.txt` (optional but psychologically recommended)
 16. exports final GGUF, drops you into chat with a parliament
 
-## training runs
+## runs
 
 | depth | data | params | experts | tok/s | loss | GPU | status |
 |-------|------|--------|---------|-------|------|-----|--------|
@@ -180,8 +180,7 @@ NOTORCH Hebbian training on LoRA only (no backward through host)
 
 the host model is a tree. DOE is the mycorrhiza. shared root system, independent growth.
 
-based on [Meta-Arianna](https://github.com/ariannamethod/arianna.c) and [Delta Voice](https://github.com/ariannamethod/ariannamethod.ai).
-
+  
 ### code-aware tokenizer
 
 detects `{}`, `()`, `->`, `==`, `//`, `#include`, `#define`, semicolons, indentation.
