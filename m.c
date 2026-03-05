@@ -57,8 +57,36 @@
  * BLAS ACCELERATION — optional. 3-4x speedup on matmul.
  *   macOS:  cc m.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o m
  *   Linux:  cc m.c -O3 -lm -lpthread -DUSE_BLAS -lopenblas -o m
+ *   GPU:    cc m.c -O3 -lm -lpthread -DUSE_CUBLAS -lcublas -lcudart -o m
  * ═══════════════════════════════════════════════════════════════════════════════ */
-#ifdef USE_BLAS
+#ifdef USE_CUBLAS
+  #include <cublas_v2.h>
+  #include <cuda_runtime.h>
+  static cublasHandle_t g_cublas;
+  static int cublas_inited = 0;
+  /* scratch buffers — grow-only, reused */
+  static float *d_scratch[4] = {NULL,NULL,NULL,NULL};
+  static size_t d_scratch_sz[4] = {0,0,0,0};
+  static void cublas_init(void) {
+      if (!cublas_inited) {
+          cublasCreate(&g_cublas);
+          /* TF32 on A100/H100: ~8x faster than FP32, negligible accuracy loss */
+          cublasSetMathMode(g_cublas, CUBLAS_TF32_TENSOR_OP_MATH);
+          struct cudaDeviceProp prop; cudaGetDeviceProperties(&prop, 0);
+          printf("[gpu] %s — %.0f MB, compute %d.%d, TF32 enabled\n",
+                 prop.name, (double)prop.totalGlobalMem/1e6, prop.major, prop.minor);
+          cublas_inited = 1;
+      }
+  }
+  static float* gpu_scratch(int slot, size_t bytes) {
+      if (bytes > d_scratch_sz[slot]) {
+          if (d_scratch[slot]) cudaFree(d_scratch[slot]);
+          cudaMalloc((void**)&d_scratch[slot], bytes);
+          d_scratch_sz[slot] = bytes;
+      }
+      return d_scratch[slot];
+  }
+#elif defined(USE_BLAS)
   #ifdef ACCELERATE
     #define ACCELERATE_NEW_LAPACK
     #include <Accelerate/Accelerate.h>
@@ -116,7 +144,7 @@ static Config config_from_depth(int depth) {
     else { c.n_kv_heads = c.n_heads / 2; if (c.n_kv_heads < 1) c.n_kv_heads = 1;
            while (c.n_heads % c.n_kv_heads != 0 && c.n_kv_heads > 1) c.n_kv_heads--; }
     c.max_experts = MAX_EXPERTS;
-    c.initial_experts = 2 + depth; /* depth 2→4, depth 4→6, depth 8→10 */
+    c.initial_experts = (depth <= 4) ? 4 : (depth <= 8) ? 6 : 8; /* sane: d2→4, d4→4, d8→6, d12→8 */
     if (c.initial_experts > MAX_EXPERTS) c.initial_experts = MAX_EXPERTS;
     c.hidden_dim = (int)(c.dim * 1.5f);
     c.hidden_dim = ((c.hidden_dim + 63) / 64) * 64;
@@ -343,7 +371,15 @@ static float silu_bwd(float x){float s=1.0f/(1.0f+expf(-x));return s+x*s*(1.0f-s
 
 static void rmsnorm(float*out,float*x,float*w,int d,float eps){float ss=0;for(int i=0;i<d;i++)ss+=x[i]*x[i];float inv=1.0f/sqrtf(ss/d+eps);for(int i=0;i<d;i++)out[i]=x[i]*inv*w[i];}
 static void matvec(float*out,float*W,float*x,int r,int co){
-#ifdef USE_BLAS
+#ifdef USE_CUBLAS
+    cublas_init();
+    float *dW=gpu_scratch(0,(size_t)r*co*4), *dx=gpu_scratch(1,(size_t)co*4), *dy=gpu_scratch(2,(size_t)r*4);
+    cudaMemcpy(dW, W, (size_t)r*co*4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dx, x, (size_t)co*4, cudaMemcpyHostToDevice);
+    float a=1,b=0;
+    cublasSgemv(g_cublas, CUBLAS_OP_T, co, r, &a, dW, co, dx, 1, &b, dy, 1);
+    cudaMemcpy(out, dy, (size_t)r*4, cudaMemcpyDeviceToHost);
+#elif defined(USE_BLAS)
     cblas_sgemv(CblasRowMajor,CblasNoTrans,r,co,1.0f,W,co,x,1,0.0f,out,1);
 #else
     for(int i=0;i<r;i++){float s=0;float*row=W+i*co;for(int j=0;j<co;j++)s+=row[j]*x[j];out[i]=s;}
@@ -356,14 +392,41 @@ static void rope_bwd(float*dv,int pos,float*cc,float*sc,int hd){int h=hd/2,off=p
 
 /* matmul: C[M,N] = A[M,K] * B[N,K]^T */
 static void mm_fwd(float*C,float*A,float*B,int M,int N,int K){
-#ifdef USE_BLAS
+#ifdef USE_CUBLAS
+    cublas_init();
+    float *dA=gpu_scratch(0,(size_t)M*K*4), *dB=gpu_scratch(1,(size_t)N*K*4), *dC=gpu_scratch(2,(size_t)M*N*4);
+    cudaMemcpy(dA, A, (size_t)M*K*4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B, (size_t)N*K*4, cudaMemcpyHostToDevice);
+    /* row-major C[M,N] = A[M,K] * B[N,K]^T → col-major: C_cm[N,M] = B[N,K] * A[M,K]^T */
+    float a=1,b=0;
+    cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &a, dB, K, dA, K, &b, dC, N);
+    cudaMemcpy(C, dC, (size_t)M*N*4, cudaMemcpyDeviceToHost);
+#elif defined(USE_BLAS)
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
 #else
     for(int m=0;m<M;m++){float*cm=C+m*N,*am=A+m*K;for(int n=0;n<N;n++){float s=0;float*bn=B+n*K;for(int k=0;k<K;k++)s+=am[k]*bn[k];cm[n]=s;}}
 #endif
 }
 static void mm_bwd(float*dA,float*dB,float*dC,float*A,float*B,int M,int N,int K){
-#ifdef USE_BLAS
+#ifdef USE_CUBLAS
+    cublas_init();
+    size_t szMK=(size_t)M*K*4, szNK=(size_t)N*K*4, szMN=(size_t)M*N*4;
+    float *ddC=gpu_scratch(0,szMN), *d_dA=gpu_scratch(1,szMK>szNK?szMK:szNK);
+    float *d_other=gpu_scratch(2,szNK>szMK?szNK:szMK);
+    float a=1,b1=1;
+    /* dA[M,K] += dC[M,N] * B[N,K] → col: dA^T[K,M] += B^T[K,N] * dC^T[N,M] */
+    cudaMemcpy(ddC, dC, szMN, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_other, B, szNK, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_dA, dA, szMK, cudaMemcpyHostToDevice);
+    cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, K, M, N, &a, d_other, N, ddC, N, &b1, d_dA, K);
+    cudaMemcpy(dA, d_dA, szMK, cudaMemcpyDeviceToHost);
+    /* dB[N,K] += dC^T[N,M] * A[M,K] → col: dB^T[K,N] += A^T[K,M] * dC^T[N,M]... */
+    /* simpler: row dB[N,K] += dC^T * A. col: dB_cm[K,N] = A_cm[K,M] * dC_cm[N,M]^T */
+    cudaMemcpy(d_other, A, szMK, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_dA, dB, szNK, cudaMemcpyHostToDevice);
+    cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_T, K, N, M, &a, d_other, K, ddC, N, &b1, d_dA, K);
+    cudaMemcpy(dB, d_dA, szNK, cudaMemcpyDeviceToHost);
+#elif defined(USE_BLAS)
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, K, N, 1.0f, dC, N, B, K, 1.0f, dA, K);
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, N, K, M, 1.0f, dC, N, A, K, 1.0f, dB, K);
 #else
