@@ -201,9 +201,9 @@ at startup (and periodically during training), DOE scans its surroundings:
 
 the scanner feeds everything else. no perception → no action.
 
-### GGUF parasite (Delta Voice + Meta-Arianna)
+### GGUF hunter (Delta Voice + Meta-Arianna)
 
-if DOE finds a compatible GGUF nearby, it doesn't ignore it. it **parasitizes** it.
+if DOE finds a compatible GGUF nearby, it doesn't ignore it. 
 
 ```
 host model (GGUF, mmap'd, read-only)
