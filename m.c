@@ -152,11 +152,9 @@ static Config config_from_depth(int depth) {
     c.attn_clamp = 30.0f; c.aux_loss_w = 0.01f;
     c.lr = 3e-4f; c.batch_size = 4; c.warmup_steps = 100;
     c.weight_decay = 0.01f; c.log_every = 20;
-    long pe = 12L*depth*c.dim*c.dim + (long)c.initial_experts*3*c.dim*c.hidden_dim*depth;
-    c.max_steps = (int)(pe * 6 / (c.batch_size * c.seq_len));
-    if (c.max_steps < 200) c.max_steps = 200;
-    if (c.max_steps > 30000) c.max_steps = 30000;
-    c.bpe_merges = 4000; c.personality_steps = 100;
+    /* max_steps computed later from actual token count — see post-tokenization */
+    c.max_steps = 0; /* 0 = auto from data */
+    c.bpe_merges = 4000; c.personality_steps = 0; /* 0 = auto from personality size */
     snprintf(c.data_url, 512, "fineweb-edu");
     snprintf(c.data_path, 256, "m_data.txt");
     snprintf(c.gguf_path, 256, "m.gguf");
@@ -982,7 +980,7 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
                     for (int j = 0; j < H; j++) {
                         da[j] += dp * exp->w_down->data[i*H+j];
                         /* dw_down[i][j] += dp * ea->silu_out[j] (but silu_out = silu(gate)*up) */
-                        if (egi >= 0) g[egi+2][i*H+j] += dp * ea->proj_out[i] ? 0 : 0;
+                        /* dead code removed — proper dw_down computed below (line 995) */
                         /* actually: dw_down[i][j] = sum_t dp * hidden_act[j] */
                     }
                 }
@@ -3059,8 +3057,32 @@ int main(int argc, char **argv) {
 
     /* Build model */
     ModelW w; init_weights(&w, &c);
+    long n_params = count_params(&w, &c);
     printf("[model] depth=%d dim=%d heads=%d kv=%d hidden=%d\n", c.depth, c.dim, c.n_heads, c.n_kv_heads, c.hidden_dim);
-    printf("[model] initial_experts=%d max=%d params=%.2fM\n", c.initial_experts, MAX_EXPERTS, (float)count_params(&w, &c) / 1e6f);
+    printf("[model] initial_experts=%d max=%d params=%.2fM\n", c.initial_experts, MAX_EXPERTS, (float)n_params / 1e6f);
+
+    /* ═══ AUTO-CONFIGURE: batch_size + max_steps from data ═══ */
+    /* Auto-reduce batch_size for tiny datasets */
+    if (nt < c.batch_size * c.seq_len * 10) {
+        c.batch_size = 1;
+    }
+    /* Frequent logging for small runs */
+    if (nt < 100000) c.log_every = 1;
+    if (c.max_steps == 0) {
+        /* 3 epochs minimum, scale up for small models */
+        int steps_per_epoch = nt / (c.batch_size * c.seq_len);
+        if (steps_per_epoch < 100) steps_per_epoch = 100;
+        float tok_per_param = (float)nt / (float)n_params;
+        int n_epochs = 3;
+        if (tok_per_param < 5.0f) n_epochs = 8;   /* underfed — more epochs */
+        if (tok_per_param < 2.0f) n_epochs = 15;   /* starving — overfit is fine */
+        if (tok_per_param > 20.0f) n_epochs = 2;   /* plenty of data */
+        c.max_steps = steps_per_epoch * n_epochs;
+        if (c.max_steps < 500) c.max_steps = 500;
+        if (c.max_steps > 500000) c.max_steps = 500000;
+        printf("[auto] %.1f tok/param → %d epochs → %d steps (data=%d tok, batch=%d×%d)\n",
+               tok_per_param, n_epochs, c.max_steps, nt, c.batch_size, c.seq_len);
+    }
 
     /* ═══ SELF-RECOGNITION — DOE looks for its own weights ═══ */
     int weights_loaded = 0;
@@ -3143,39 +3165,55 @@ int main(int argc, char **argv) {
     int total_births = 0, total_deaths = 0;
     float prev_meta_loss = 0;
 
+    int topology_changed = 0; /* set by mitosis/apoptosis, cleared after rebuild */
+
     for (int step = 0; step < c.max_steps; step++) {
         float lr = c.lr;
         if (step < c.warmup_steps) lr = c.lr * ((float)(step+1) / c.warmup_steps);
         else { float p = (float)(step - c.warmup_steps) / (float)(c.max_steps - c.warmup_steps); lr = c.lr * 0.5f * (1.0f + cosf(3.14159f * p)); }
         if (lr < c.lr * 0.01f) lr = c.lr * 0.01f;
 
-        int ms = nt - c.seq_len - 1; if (ms < 0) ms = 0;
-        int st = (int)(rand_uniform() * ms);
-
         /* Harmonic decomposition of recent loss/entropy history */
         float loss_hist[16]; int lh_len = 0;
         for (int i = 0; i < 16 && i < step; i++) loss_hist[lh_len++] = chuck.hist[(chuck.pos - 1 - i + CHUCK_WINDOW) % CHUCK_WINDOW];
         if (lh_len > 2) harmonic_decompose(&ts.hs, loss_hist, lh_len);
 
-        float loss = train_fwd(&w, &c, &ts, all_tok + st, all_tok + st + 1, c.seq_len);
-        rl += loss; lc++;
+        /* Rebuild params/grads only when topology changed (birth/death) */
+        if (topology_changed) {
+            free(params.tensors);
+            for (int i = 0; i < params.count; i++) free(grads[i]);
+            free(grads);
+            params = collect_params(&w, &c);
+            grads = calloc(params.count, sizeof(float*));
+            for (int i = 0; i < params.count; i++) grads[i] = calloc(params.tensors[i]->size, 4);
+            adam_free(opt); opt = adam_new(&params);
+            topology_changed = 0;
+        }
 
-        /* Rebuild param list (experts may have changed) */
-        free(params.tensors);
-        for (int i = 0; i < params.count; i++) free(grads[i]);
-        free(grads);
-        params = collect_params(&w, &c);
-        grads = calloc(params.count, sizeof(float*));
-        for (int i = 0; i < params.count; i++) grads[i] = calloc(params.tensors[i]->size, 4);
-
-        train_bwd(&w, &c, &ts, all_tok + st, all_tok + st + 1, c.seq_len, grads);
+        /* ═══ GRADIENT ACCUMULATION — actual batching ═══ */
+        float batch_loss = 0;
+        int ms = nt - c.seq_len - 1; if (ms < 0) ms = 0;
+        /* Zero grads before accumulation */
+        for (int i = 0; i < params.count; i++) memset(grads[i], 0, params.tensors[i]->size * 4);
+        for (int b = 0; b < c.batch_size; b++) {
+            int st = (int)(rand_uniform() * ms);
+            float loss = train_fwd(&w, &c, &ts, all_tok + st, all_tok + st + 1, c.seq_len);
+            batch_loss += loss;
+            train_bwd(&w, &c, &ts, all_tok + st, all_tok + st + 1, c.seq_len, grads);
+        }
+        batch_loss /= c.batch_size;
+        /* Scale grads by 1/batch_size */
+        float inv_bs = 1.0f / c.batch_size;
+        for (int i = 0; i < params.count; i++)
+            for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= inv_bs;
+        rl += batch_loss; lc++;
+        float loss = batch_loss; /* for downstream logging/chuck */
 
         /* Chuck step — self-aware optimizer */
         chuck_step(&chuck, chuck_layers, c.depth, lr, loss, &params, grads, c.weight_decay, &tok_eye, &parser_eye);
 
         /* Adam update with Chuck's effective LR */
         float eff_lr = lr * chuck.dampen * chuck.sigma * chuck.lr_scale;
-        if (opt->np != params.count) { adam_free(opt); opt = adam_new(&params); }
         adam_step(opt, &params, grads, eff_lr, c.weight_decay);
 
         /* ═══ CALENDAR DRIFT SNAPSHOT ═══ */
@@ -3222,20 +3260,9 @@ int main(int argc, char **argv) {
                 }
             }
         }
-        /* Force Adam rebuild after birth/death — even if param count unchanged,
-           tensors changed identity so Adam m/v states would be stale */
+        /* Mark topology changed if birth/death happened — rebuild at start of next step */
         int step_births = total_births - prev_births, step_deaths = total_deaths - prev_deaths;
-        if (step_births > 0 || step_deaths > 0) {
-            int old_np = opt->np;
-            /* Rebuild params to reflect new expert topology */
-            free(params.tensors);
-            for (int i = 0; i < params.count; i++) free(grads[i]);
-            free(grads);
-            params = collect_params(&w, &c);
-            grads = calloc(params.count, sizeof(float*));
-            for (int i = 0; i < params.count; i++) grads[i] = calloc(params.tensors[i]->size, 4);
-            if (old_np != params.count) { adam_free(opt); opt = adam_new(&params); }
-        }
+        if (step_births > 0 || step_deaths > 0) topology_changed = 1;
 
         /* ═══ EPHEMERAL CONFIG ═══ */
         EphemeralConfig eph = ephemeral_compute(&tok_eye, &parser_eye, &ts.hs,
@@ -3284,7 +3311,7 @@ int main(int argc, char **argv) {
             for (int l = 0; l < c.depth; l++) total_alive += w.layers[l].n_alive;
             printf("  step %4d/%d  loss=%.4f  lr=%.2e  tok/s=%.0f  experts=%d  consensus=%.2f  chuck:λ=%.2f,σ=%.2f  drift=%.3f(%.2f)  eph:temp=%.2f,layers=%d  (%.1fs)\n",
                    step+1, c.max_steps, rl/lc, eff_lr,
-                   (float)((step+1)*c.seq_len)/el,
+                   (float)((step+1)*c.seq_len*c.batch_size)/el,
                    total_alive,
                    w.layers[0].parliament.consensus,
                    chuck.dampen, chuck.sigma,
@@ -3326,30 +3353,39 @@ int main(int argc, char **argv) {
     {
         struct stat pst;
         if (stat(c.personality_path, &pst) == 0 && pst.st_size > 10) {
-            printf("[personality] found %s, finetuning...\n", c.personality_path);
             int pl; char *ptxt = load_text(c.personality_path, &pl);
             if (ptxt && pl > 10) {
                 int pnt; int *ptok = tok_encode(&tok, ptxt, pl, &pnt);
-                if (weights_loaded) {
-                    /* Need fresh params/grads/opt for finetune after GGUF load */
+                /* Auto personality_steps: 5 epochs over personality data */
+                int p_steps = c.personality_steps;
+                if (p_steps == 0) {
+                    int steps_per_epoch = pnt / c.seq_len;
+                    p_steps = steps_per_epoch * 5;
+                    if (p_steps < 500) p_steps = 500;
+                    if (p_steps > 20000) p_steps = 20000;
+                }
+                printf("[personality] found %s (%d tokens), finetuning %d steps...\n",
+                       c.personality_path, pnt, p_steps);
+                if (weights_loaded || topology_changed) {
+                    /* Rebuild params/grads/adam: needed after GGUF load or if last
+                     * training step triggered mitosis/apoptosis (use-after-free fix) */
+                    if (!weights_loaded) { for (int i = 0; i < params.count; i++) free(grads[i]); free(grads); adam_free(opt); }
                     params = collect_params(&w, &c);
                     grads = calloc(params.count, sizeof(float*));
                     for (int i = 0; i < params.count; i++) grads[i] = calloc(params.tensors[i]->size, 4);
                     opt = adam_new(&params);
+                    topology_changed = 0;
                 }
-                for (int step = 0; step < c.personality_steps && pnt > c.seq_len + 1; step++) {
+                for (int step = 0; step < p_steps && pnt > c.seq_len + 1; step++) {
                     int ps = (int)(rand_uniform() * (pnt - c.seq_len - 1));
+                    /* Zero grads */
+                    for (int i = 0; i < params.count; i++) memset(grads[i], 0, params.tensors[i]->size * 4);
                     float ploss = train_fwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len);
-                    free(params.tensors); for (int i = 0; i < params.count; i++) free(grads[i]); free(grads);
-                    params = collect_params(&w, &c);
-                    grads = calloc(params.count, sizeof(float*));
-                    for (int i = 0; i < params.count; i++) grads[i] = calloc(params.tensors[i]->size, 4);
                     train_bwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len, grads);
                     float gn = 0; for (int i = 0; i < params.count; i++) for (int j = 0; j < params.tensors[i]->size; j++) gn += grads[i][j]*grads[i][j]; gn = sqrtf(gn);
                     if (gn > 1.0f) { float s = 1.0f/gn; for (int i = 0; i < params.count; i++) for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= s; }
-                    if (opt->np != params.count) { adam_free(opt); opt = adam_new(&params); }
                     adam_step(opt, &params, grads, c.lr * 0.1f, c.weight_decay);
-                    if ((step+1) % 20 == 0) printf("  personality step %d/%d  loss=%.4f\n", step+1, c.personality_steps, ploss);
+                    if ((step+1) % 100 == 0) printf("  personality step %d/%d  loss=%.4f\n", step+1, p_steps, ploss);
                 }
                 free(ptok);
             }
