@@ -76,9 +76,19 @@ fi
 # ═══ Mycelium ═══
 [ -d "mycelium" ] && ok "mycelium dir" || fail "no mycelium"
 
+# ═══ Environment Scanner ═══
+grep -q "\[env\] cpu=" test_output.txt && ok "environment scan" || fail "no env scan"
+grep -q "compiler=" test_output.txt && ok "compiler detection" || fail "no compiler detect"
+
+# ═══ Parasite System ═══
+grep -q "\[parasite\]" test_output.txt && ok "parasite system" || fail "no parasite"
+
+# ═══ Code Detection ═══
+grep -q "code=" test_output.txt && ok "code detection" || fail "no code detect"
+
 # ═══ Sizes ═══
 LINES=$(wc -l < m.c | tr -d ' ')
-[ "$LINES" -gt 2000 ] && ok "m.c ${LINES} lines" || fail "m.c too small"
+[ "$LINES" -gt 3000 ] && ok "m.c ${LINES} lines" || fail "m.c too small"
 
 # Cleanup
 rm -f m_test test_data.txt test_data_seed.txt test_output.txt

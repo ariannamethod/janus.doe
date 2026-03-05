@@ -42,6 +42,16 @@
 #include <float.h>
 #include <stdint.h>
 #include <errno.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#ifdef __linux__
+  #include <sys/statvfs.h>
+#endif
+#ifdef __APPLE__
+  #include <sys/param.h>
+  #include <sys/mount.h>
+  #include <sys/sysctl.h>
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * BLAS ACCELERATION — optional. 3-4x speedup on matmul.
@@ -151,13 +161,15 @@ typedef struct { char *key; int val; } StoiEntry;
 typedef struct { StoiEntry entries[TOK_STOI_CAP]; } StoiTable;
 typedef struct { char *tokens[TOK_MAX_VOCAB]; int vocab_size; StoiTable stoi; int bos_id,eos_id; MergePair *merges; int n_merges; } Tokenizer;
 
-/* Self-awareness eye for the tokenizer */
+/* Self-awareness eye for the tokenizer — it knows what it eats */
 typedef struct {
     float compression_ratio; /* bytes_in / tokens_out, EMA */
     float oov_rate;          /* unknown token frequency, EMA */
     float entropy;           /* token distribution entropy */
     int total_encoded;       /* lifetime token count */
     float health;            /* composite signal for Chuck */
+    float code_ratio;        /* % of input that looks like code */
+    int code_mode;           /* 0=text, 1=code detected */
 } TokenizerEye;
 
 static unsigned int str_hash(const char *s){unsigned int h=5381;while(*s)h=h*33+(unsigned char)*s++;return h;}
@@ -237,6 +249,33 @@ static void tok_eye_update(TokenizerEye *eye, int bytes_in, int tokens_out, int 
     /* health: high compression + low OOV + moderate entropy = good */
     eye->health = fminf(1.0f, eye->compression_ratio / 4.0f) * (1.0f - eye->oov_rate);
     if (eye->entropy < 1.0f) eye->health *= 0.8f; /* repetitive input warning */
+}
+
+/* Code detection — does this text look like source code? */
+static void tok_eye_detect_code(TokenizerEye *eye, const char *text, int len) {
+    int code_signals = 0, total_lines = 0;
+    const char *p = text, *end = text + len;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', end - p);
+        int ll = nl ? (int)(nl - p) : (int)(end - p);
+        total_lines++;
+        /* Code heuristics: indentation, braces, semicolons, keywords */
+        if (ll > 0 && (p[0] == ' ' || p[0] == '\t')) code_signals++; /* indented */
+        for (int i = 0; i < ll - 1; i++) {
+            if (p[i] == '{' || p[i] == '}') { code_signals++; break; }
+            if (p[i] == '(' && p[i+1] == ')') { code_signals++; break; }
+            if (p[i] == '-' && p[i+1] == '>') { code_signals++; break; }
+            if (p[i] == '=' && p[i+1] == '=') { code_signals++; break; }
+            if (p[i] == '/' && p[i+1] == '/') { code_signals++; break; }
+            if (p[i] == '#' && (ll > i+7 && strncmp(p+i, "#include", 8) == 0)) { code_signals += 3; break; }
+            if (p[i] == '#' && (ll > i+6 && strncmp(p+i, "#define", 7) == 0)) { code_signals += 3; break; }
+        }
+        if (ll > 0 && p[ll-1] == ';') code_signals++;
+        p = nl ? nl + 1 : end;
+    }
+    eye->code_ratio = (total_lines > 0) ? (float)code_signals / (total_lines * 2) : 0;
+    if (eye->code_ratio > 1.0f) eye->code_ratio = 1.0f;
+    eye->code_mode = (eye->code_ratio > 0.3f) ? 1 : 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -2027,6 +2066,681 @@ static EphemeralConfig ephemeral_compute(TokenizerEye *tok_eye, ParserEye *parse
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * ENVIRONMENT SCANNER — DOE opens its eyes. looks around. counts its resources.
+ * what GGUFs are nearby? how much RAM? is there a compiler? can it curl?
+ * a model that doesn't know its own filesystem is a model that can't survive.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+typedef struct {
+    char path[256];
+    char arch[64];      /* "llama", "grok", "mixtral", "m" — from GGUF metadata */
+    int n_layers;
+    int dim;
+    int n_heads;
+    int64_t file_size;
+    float compatibility; /* 0..1 — how usable is this GGUF for parasite mode */
+} DiscoveredGGUF;
+
+typedef struct {
+    DiscoveredGGUF ggufs[32];
+    int n_ggufs;
+    int64_t disk_free;
+    int cpu_count;
+    int64_t mem_available;
+    int has_compiler;
+    int has_curl;
+    char self_path[256]; /* path to own m.c source */
+} Environment;
+
+/* Read GGUF header — just metadata, no tensor loading. peek at the corpse. */
+static int gguf_sniff(const char *path, DiscoveredGGUF *out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    struct stat st; fstat(fileno(f), &st); out->file_size = st.st_size;
+    snprintf(out->path, 256, "%s", path);
+    memset(out->arch, 0, 64); out->n_layers = 0; out->dim = 0; out->n_heads = 0;
+
+    uint32_t magic; if (fread(&magic, 4, 1, f) != 1 || magic != 0x46554747) { fclose(f); return 0; }
+    uint32_t version; fread(&version, 4, 1, f);
+    uint64_t n_tensors, n_kv; fread(&n_tensors, 8, 1, f); fread(&n_kv, 8, 1, f);
+
+    /* Parse metadata KV pairs — we only care about architecture, dim, layers, heads */
+    for (uint64_t i = 0; i < n_kv && i < 64; i++) {
+        uint64_t klen; if (fread(&klen, 8, 1, f) != 1) break;
+        if (klen > 255) break;
+        char key[256]; if (fread(key, 1, klen, f) != klen) break; key[klen] = '\0';
+        uint32_t vtype; if (fread(&vtype, 4, 1, f) != 1) break;
+
+        if (vtype == 8) { /* string */
+            uint64_t vlen; fread(&vlen, 8, 1, f);
+            char val[256]; int rl = vlen < 255 ? (int)vlen : 255;
+            fread(val, 1, rl, f); val[rl] = '\0';
+            if (vlen > 255) fseek(f, vlen - 255, SEEK_CUR);
+            if (strstr(key, "general.architecture")) snprintf(out->arch, 64, "%s", val);
+        } else if (vtype == 4) { /* uint32 */
+            uint32_t val; fread(&val, 4, 1, f);
+            if (strstr(key, "embedding_length")) out->dim = (int)val;
+            else if (strstr(key, "block_count")) out->n_layers = (int)val;
+            else if (strstr(key, "head_count") && !strstr(key, "kv")) out->n_heads = (int)val;
+        } else if (vtype == 5) { /* int32 */
+            fseek(f, 4, SEEK_CUR);
+        } else if (vtype == 6) { /* float32 */
+            fseek(f, 4, SEEK_CUR);
+        } else if (vtype == 10) { /* uint64 */
+            fseek(f, 8, SEEK_CUR);
+        } else if (vtype == 7) { /* bool */
+            fseek(f, 1, SEEK_CUR);
+        } else {
+            break; /* unknown type — stop parsing, we got enough */
+        }
+    }
+    fclose(f);
+    return (out->arch[0] != '\0' && out->dim > 0);
+}
+
+static void env_scan(Environment *env, const char *self_src, int doe_dim) {
+    memset(env, 0, sizeof(Environment));
+    snprintf(env->self_path, 256, "%s", self_src);
+
+    /* CPU count */
+    env->cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
+
+    /* Memory */
+#ifdef __linux__
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    env->mem_available = (int64_t)pages * page_size;
+#elif defined(__APPLE__)
+    int64_t mem = 0; size_t len = sizeof(mem);
+    sysctlbyname("hw.memsize", &mem, &len, NULL, 0);
+    env->mem_available = mem;
+#endif
+
+    /* Disk free */
+#ifdef __linux__
+    struct statvfs sv; if (statvfs(".", &sv) == 0) env->disk_free = (int64_t)sv.f_bavail * sv.f_frsize;
+#elif defined(__APPLE__)
+    struct statfs sf; if (statfs(".", &sf) == 0) env->disk_free = (int64_t)sf.f_bavail * sf.f_bsize;
+#endif
+
+    /* Check for compiler and curl — the tools of survival */
+    env->has_compiler = (system("which cc >/dev/null 2>&1") == 0);
+    env->has_curl = (system("which curl >/dev/null 2>&1") == 0);
+
+    /* Scan for GGUFs — find . -name '*.gguf' -maxdepth 3 */
+    FILE *p = popen("find . -name '*.gguf' -maxdepth 3 2>/dev/null", "r");
+    if (p) {
+        char line[256];
+        while (fgets(line, sizeof(line), p) && env->n_ggufs < 32) {
+            int len = strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+            if (len == 0) continue;
+            DiscoveredGGUF dg;
+            if (gguf_sniff(line, &dg)) {
+                /* Compatibility: dim match = best, dim multiple = ok, else = poor */
+                if (dg.dim == doe_dim) dg.compatibility = 1.0f;
+                else if (doe_dim > 0 && dg.dim % doe_dim == 0) dg.compatibility = 0.7f;
+                else if (doe_dim > 0 && abs(dg.dim - doe_dim) < 128) dg.compatibility = 0.5f;
+                else dg.compatibility = 0.1f;
+                env->ggufs[env->n_ggufs++] = dg;
+            }
+        }
+        pclose(p);
+    }
+
+    printf("[env] cpu=%d mem=%.1fGB disk=%.1fGB compiler=%s curl=%s ggufs=%d\n",
+           env->cpu_count,
+           (float)env->mem_available / (1024*1024*1024),
+           (float)env->disk_free / (1024*1024*1024),
+           env->has_compiler ? "yes" : "no",
+           env->has_curl ? "yes" : "no",
+           env->n_ggufs);
+
+    for (int i = 0; i < env->n_ggufs; i++) {
+        DiscoveredGGUF *g = &env->ggufs[i];
+        printf("  [env] gguf: %s arch=%s dim=%d layers=%d size=%.1fMB compat=%.1f\n",
+               g->path, g->arch, g->dim, g->n_layers,
+               (float)g->file_size / (1024*1024), g->compatibility);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * GGUF PARASITE — DOE finds a bigger model. wraps it with LoRA. controls it.
+ * the smallest model that ever commanded a 7B. like a remora on a shark.
+ * like a virus that makes the host cell produce more virus.
+ * "i am not the model. i am the thing that tells the model what to think."
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+#define LORA_RANK 16
+#define LORA_MAX_LAYERS 32
+
+typedef struct {
+    /* Host model — mmap'd from GGUF, read-only. the shark. */
+    uint8_t *mmap_base;
+    size_t mmap_size;
+    int host_n_layers, host_dim, host_hidden, host_heads, host_kv_heads, host_head_dim;
+    int host_vocab;
+    float *host_tok_emb;    /* [vocab, dim] */
+    float *host_output;     /* [vocab, dim] */
+    float *host_norm;       /* [dim] */
+    struct {
+        float *wq, *wk, *wv, *wo;
+        float *ffn_gate, *ffn_up, *ffn_down;
+        float *attn_norm, *ffn_norm;
+    } layers[LORA_MAX_LAYERS];
+
+    /* DOE's LoRA overlays — the remora. small. trained. in control. */
+    /* Delta Voice: out += alpha * A @ (B @ x) */
+    float *lora_A[LORA_MAX_LAYERS];   /* [dim, rank] — output projection */
+    float *lora_B[LORA_MAX_LAYERS];   /* [rank, dim] — input projection */
+    float attention_bias[LORA_MAX_LAYERS];  /* per-layer attention scaling (Meta-Arianna) */
+    float layer_focus[LORA_MAX_LAYERS];     /* per-layer residual scaling */
+    float lora_alpha;
+
+    int active;
+    char host_path[256];
+} ParasiteState;
+
+/* Parse GGUF tensor info entry */
+typedef struct { char name[96]; uint32_t ndim; uint64_t dims[4]; uint32_t dtype; uint64_t offset; } GGUFTensorInfo;
+
+static int parasite_load(ParasiteState *ps, const char *path, int doe_dim) {
+    memset(ps, 0, sizeof(ParasiteState));
+    snprintf(ps->host_path, 256, "%s", path);
+    ps->lora_alpha = 0.1f;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat st; fstat(fd, &st);
+    ps->mmap_size = st.st_size;
+    ps->mmap_base = mmap(NULL, ps->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (ps->mmap_base == MAP_FAILED) { ps->mmap_base = NULL; return 0; }
+
+    /* Parse GGUF header from mmap'd data */
+    uint8_t *p = ps->mmap_base;
+    uint8_t *pend = ps->mmap_base + ps->mmap_size;
+    #define PCHECK(n) do { if (p + (n) > pend) goto bail; } while(0)
+    PCHECK(4); uint32_t magic = *(uint32_t*)p; p += 4;
+    if (magic != 0x46554747) goto bail;
+    PCHECK(4); uint32_t ver = *(uint32_t*)p; p += 4; (void)ver;
+    PCHECK(8); uint64_t n_tensors = *(uint64_t*)p; p += 8;
+    PCHECK(8); uint64_t n_kv = *(uint64_t*)p; p += 8;
+
+    /* Parse metadata to get model dimensions */
+    for (uint64_t i = 0; i < n_kv && i < 64; i++) {
+        PCHECK(8); uint64_t klen = *(uint64_t*)p; p += 8;
+        if (klen > 255) break;
+        char key[256]; memcpy(key, p, klen); key[klen] = '\0'; p += klen;
+        uint32_t vtype = *(uint32_t*)p; p += 4;
+        if (vtype == 8) { /* string */
+            uint64_t vlen = *(uint64_t*)p; p += 8; p += vlen;
+        } else if (vtype == 4) { /* uint32 */
+            uint32_t val = *(uint32_t*)p; p += 4;
+            if (strstr(key, "embedding_length")) ps->host_dim = (int)val;
+            else if (strstr(key, "block_count")) ps->host_n_layers = (int)val;
+            else if (strstr(key, "head_count") && !strstr(key, "kv")) ps->host_heads = (int)val;
+            else if (strstr(key, "head_count_kv")) ps->host_kv_heads = (int)val;
+            else if (strstr(key, "feed_forward_length")) ps->host_hidden = (int)val;
+            else if (strstr(key, "context_length")) { /* ignore */ }
+            else if (strstr(key, "vocab_size")) ps->host_vocab = (int)val;
+        } else if (vtype == 5) p += 4; /* int32 */
+        else if (vtype == 6) p += 4;   /* float32 */
+        else if (vtype == 10) p += 8;  /* uint64 */
+        else if (vtype == 7) p += 1;   /* bool */
+        else break;
+    }
+
+    if (ps->host_dim == 0 || ps->host_n_layers == 0) goto bail;
+    if (ps->host_heads == 0) ps->host_heads = ps->host_dim / 64;
+    if (ps->host_kv_heads == 0) ps->host_kv_heads = ps->host_heads;
+    ps->host_head_dim = ps->host_dim / ps->host_heads;
+    if (ps->host_hidden == 0) ps->host_hidden = ps->host_dim * 4;
+
+    /* Parse tensor info entries — find offsets for each weight */
+    if (n_tensors > 10000) goto bail; /* sanity check */
+    GGUFTensorInfo *tinfo = calloc(n_tensors, sizeof(GGUFTensorInfo));
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        PCHECK(8); uint64_t nlen = *(uint64_t*)p; p += 8;
+        if (nlen > 256) { free(tinfo); goto bail; }
+        int nl = nlen < 95 ? (int)nlen : 95;
+        PCHECK(nlen); memcpy(tinfo[i].name, p, nl); tinfo[i].name[nl] = '\0'; p += nlen;
+        PCHECK(4); tinfo[i].ndim = *(uint32_t*)p; p += 4;
+        if (tinfo[i].ndim > 4) { free(tinfo); goto bail; }
+        for (uint32_t d = 0; d < tinfo[i].ndim; d++) { PCHECK(8); tinfo[i].dims[d] = *(uint64_t*)p; p += 8; }
+        PCHECK(4); tinfo[i].dtype = *(uint32_t*)p; p += 4;
+        PCHECK(8); tinfo[i].offset = *(uint64_t*)p; p += 8;
+    }
+
+    /* Align to 32 bytes — tensor data starts here */
+    uint64_t header_size = p - ps->mmap_base;
+    uint64_t data_start = ((header_size + 31) / 32) * 32;
+
+    /* Map tensor names to weight pointers — the parasitic wiring */
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        if (tinfo[i].dtype != 0) continue; /* only float32 for now */
+        float *data = (float*)(ps->mmap_base + data_start + tinfo[i].offset);
+        char *n = tinfo[i].name;
+
+        if (strcmp(n, "token_embd.weight") == 0) { ps->host_tok_emb = data; if (ps->host_vocab == 0) ps->host_vocab = (int)tinfo[i].dims[1]; }
+        else if (strcmp(n, "output_norm.weight") == 0) ps->host_norm = data;
+        else if (strcmp(n, "output.weight") == 0) ps->host_output = data;
+        else {
+            int l = -1; sscanf(n, "blk.%d.", &l);
+            if (l >= 0 && l < LORA_MAX_LAYERS && l < ps->host_n_layers) {
+                if (strstr(n, "attn_q.weight")) ps->layers[l].wq = data;
+                else if (strstr(n, "attn_k.weight")) ps->layers[l].wk = data;
+                else if (strstr(n, "attn_v.weight")) ps->layers[l].wv = data;
+                else if (strstr(n, "attn_output.weight")) ps->layers[l].wo = data;
+                else if (strstr(n, "ffn_gate.weight") && !strstr(n, "ffn_gate_inp")) ps->layers[l].ffn_gate = data;
+                else if (strstr(n, "ffn_up.weight")) ps->layers[l].ffn_up = data;
+                else if (strstr(n, "ffn_down.weight")) ps->layers[l].ffn_down = data;
+                else if (strstr(n, "attn_norm.weight")) ps->layers[l].attn_norm = data;
+                else if (strstr(n, "ffn_norm.weight")) ps->layers[l].ffn_norm = data;
+            }
+        }
+    }
+    free(tinfo);
+
+    /* Verify minimum viable host — can't parasitize a headless corpse */
+    if (!ps->host_tok_emb || !ps->host_output || !ps->host_norm) {
+        printf("[parasite] host GGUF missing essential weights (tok=%p out=%p norm=%p). abandoning.\n",
+               (void*)ps->host_tok_emb, (void*)ps->host_output, (void*)ps->host_norm);
+        munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; return 0;
+    }
+    /* Skip MoE GGUFs that have expert-specific FFN layers (can't parasitize ourselves) */
+    int has_standard_ffn = 0;
+    for (int l = 0; l < ps->host_n_layers && l < LORA_MAX_LAYERS; l++)
+        if (ps->layers[l].ffn_gate && ps->layers[l].ffn_up && ps->layers[l].ffn_down) has_standard_ffn = 1;
+    if (!has_standard_ffn) {
+        printf("[parasite] host has no standard FFN layers (MoE?). parasite needs a plain transformer.\n");
+        munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; return 0;
+    }
+
+    /* Allocate LoRA matrices — Delta Voice: out += α * A @ (B @ x) */
+    int ld = ps->host_dim;
+    for (int l = 0; l < ps->host_n_layers && l < LORA_MAX_LAYERS; l++) {
+        ps->lora_A[l] = calloc(ld * LORA_RANK, 4);
+        ps->lora_B[l] = calloc(LORA_RANK * ld, 4);
+        /* Xavier init for LoRA */
+        float scale = 0.02f / sqrtf((float)LORA_RANK);
+        for (int j = 0; j < ld * LORA_RANK; j++) ps->lora_A[l][j] = rand_normal() * scale;
+        for (int j = 0; j < LORA_RANK * ld; j++) ps->lora_B[l][j] = rand_normal() * scale;
+        ps->attention_bias[l] = 0.0f;  /* start neutral — DOE learns to modulate */
+        ps->layer_focus[l] = 1.0f;     /* start at 1.0 — no scaling initially */
+    }
+
+    ps->active = 1;
+    printf("[parasite] attached to %s (dim=%d layers=%d heads=%d vocab=%d, %.1fMB)\n",
+           path, ps->host_dim, ps->host_n_layers, ps->host_heads,
+           ps->host_vocab, (float)ps->mmap_size / (1024*1024));
+    printf("[parasite] LoRA rank=%d alpha=%.2f — the remora is feeding.\n", LORA_RANK, ps->lora_alpha);
+    #undef PCHECK
+    return 1;
+bail:
+    if (ps->mmap_base) { munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; }
+    printf("[parasite] GGUF parse failed. the remora loses its grip.\n");
+    return 0;
+}
+
+/* Parasite forward — run input through host model with DOE's LoRA injection.
+ * the shark swims. the remora steers. nobody knows who's really in charge.
+ * returns logits over host vocabulary. */
+static void parasite_forward(ParasiteState *ps, int token, int pos, float *out_logits,
+                              float *kv_cache_k, float *kv_cache_v, int max_seq) {
+    int D = ps->host_dim, H = ps->host_heads, HD = ps->host_head_dim;
+    int KVH = ps->host_kv_heads, HG = H / KVH;
+
+    /* Embedding */
+    float *x = calloc(D, 4);
+    if (token < ps->host_vocab) memcpy(x, ps->host_tok_emb + token * D, D * 4);
+
+    float *tmp = calloc(D > ps->host_hidden ? ps->host_hidden : D, 4);
+    float *lora_tmp = calloc(LORA_RANK, 4);
+
+    for (int l = 0; l < ps->host_n_layers && l < LORA_MAX_LAYERS; l++) {
+        if (!ps->layers[l].wq) continue;
+
+        /* RMSNorm */
+        float *xn = calloc(D, 4);
+        float ss = 0; for (int i = 0; i < D; i++) ss += x[i] * x[i];
+        ss = 1.0f / sqrtf(ss / D + 1e-6f);
+        if (ps->layers[l].attn_norm)
+            for (int i = 0; i < D; i++) xn[i] = x[i] * ss * ps->layers[l].attn_norm[i];
+        else
+            for (int i = 0; i < D; i++) xn[i] = x[i] * ss;
+
+        /* QKV projections */
+        int qd = H * HD, kd = KVH * HD;
+        float *q = calloc(qd, 4), *k = calloc(kd, 4), *v = calloc(kd, 4);
+        for (int i = 0; i < qd; i++) { float s = 0; for (int j = 0; j < D; j++) s += ps->layers[l].wq[i*D+j] * xn[j]; q[i] = s; }
+        for (int i = 0; i < kd; i++) { float s = 0; for (int j = 0; j < D; j++) s += ps->layers[l].wk[i*D+j] * xn[j]; k[i] = s; }
+        for (int i = 0; i < kd; i++) { float s = 0; for (int j = 0; j < D; j++) s += ps->layers[l].wv[i*D+j] * xn[j]; v[i] = s; }
+
+        /* RoPE on Q and K */
+        /* Inline RoPE — no precomputed cache in parasite mode */
+        for (int h = 0; h < H; h++) {
+            float *qh = q + h * HD; int half = HD / 2;
+            for (int i = 0; i < half; i++) {
+                float ang = (float)pos / powf(10000.0f, 2.0f * i / (float)HD);
+                float co = cosf(ang), si = sinf(ang);
+                float x0 = qh[i], x1 = qh[i + half];
+                qh[i] = x0 * co - x1 * si; qh[i + half] = x0 * si + x1 * co;
+            }
+        }
+        for (int h = 0; h < KVH; h++) {
+            float *kh = k + h * HD; int half = HD / 2;
+            for (int i = 0; i < half; i++) {
+                float ang = (float)pos / powf(10000.0f, 2.0f * i / (float)HD);
+                float co = cosf(ang), si = sinf(ang);
+                float x0 = kh[i], x1 = kh[i + half];
+                kh[i] = x0 * co - x1 * si; kh[i + half] = x0 * si + x1 * co;
+            }
+        }
+
+        /* KV cache */
+        int kv_off_k = l * max_seq * kd + pos * kd;
+        int kv_off_v = l * max_seq * kd + pos * kd;
+        memcpy(kv_cache_k + kv_off_k, k, kd * 4);
+        memcpy(kv_cache_v + kv_off_v, v, kd * 4);
+
+        /* Attention with DOE bias — the parasite's grip */
+        float bias = 1.0f + ps->attention_bias[l];
+        float sc = 1.0f / sqrtf((float)HD);
+        float *attn_out = calloc(qd, 4);
+        for (int h = 0; h < H; h++) {
+            int kvh = h / HG;
+            float *qh = q + h * HD;
+            float *att = calloc(pos + 1, 4);
+            for (int t = 0; t <= pos; t++) {
+                float *kt = kv_cache_k + l * max_seq * kd + t * kd + kvh * HD;
+                float d = 0; for (int i = 0; i < HD; i++) d += qh[i] * kt[i];
+                att[t] = d * sc * bias; /* DOE modulates attention strength */
+            }
+            /* Softmax */
+            float mx = att[0]; for (int t = 1; t <= pos; t++) if (att[t] > mx) mx = att[t];
+            float se = 0; for (int t = 0; t <= pos; t++) { att[t] = expf(att[t] - mx); se += att[t]; }
+            for (int t = 0; t <= pos; t++) att[t] /= se;
+            /* Weighted sum */
+            float *oh = attn_out + h * HD;
+            for (int t = 0; t <= pos; t++) {
+                float a = att[t];
+                float *vt = kv_cache_v + l * max_seq * kd + t * kd + kvh * HD;
+                for (int i = 0; i < HD; i++) oh[i] += a * vt[i];
+            }
+            free(att);
+        }
+
+        /* Output projection */
+        float *ao = calloc(D, 4);
+        if (ps->layers[l].wo)
+            for (int i = 0; i < D; i++) { float s = 0; for (int j = 0; j < qd; j++) s += ps->layers[l].wo[i*qd+j] * attn_out[j]; ao[i] = s; }
+
+        /* Residual + attention */
+        for (int i = 0; i < D; i++) x[i] += ao[i];
+        free(q); free(k); free(v); free(attn_out); free(ao);
+
+        /* FFN with LoRA injection — the remora feeds */
+        float *fn = calloc(D, 4);
+        ss = 0; for (int i = 0; i < D; i++) ss += x[i] * x[i];
+        ss = 1.0f / sqrtf(ss / D + 1e-6f);
+        if (ps->layers[l].ffn_norm)
+            for (int i = 0; i < D; i++) fn[i] = x[i] * ss * ps->layers[l].ffn_norm[i];
+        else
+            for (int i = 0; i < D; i++) fn[i] = x[i] * ss;
+
+        /* SwiGLU FFN (if host has it) */
+        int HH = ps->host_hidden;
+        if (ps->layers[l].ffn_gate && ps->layers[l].ffn_up && ps->layers[l].ffn_down) {
+            float *gate = calloc(HH, 4), *up = calloc(HH, 4);
+            for (int i = 0; i < HH; i++) {
+                float sg = 0, su = 0;
+                for (int j = 0; j < D; j++) { sg += ps->layers[l].ffn_gate[i*D+j] * fn[j]; su += ps->layers[l].ffn_up[i*D+j] * fn[j]; }
+                gate[i] = sg / (1.0f + expf(-sg)) * su; /* SwiGLU */
+            }
+            float *ffn_out = calloc(D, 4);
+            for (int i = 0; i < D; i++) { float s = 0; for (int j = 0; j < HH; j++) s += ps->layers[l].ffn_down[i*HH+j] * gate[j]; ffn_out[i] = s; }
+            for (int i = 0; i < D; i++) x[i] += ffn_out[i] * ps->layer_focus[l];
+            free(gate); free(up); free(ffn_out);
+        }
+
+        /* LoRA injection: x += alpha * A @ (B @ xn) — Delta Voice through the host */
+        memset(lora_tmp, 0, LORA_RANK * 4);
+        for (int r = 0; r < LORA_RANK; r++) {
+            float s = 0;
+            for (int j = 0; j < D; j++) s += ps->lora_B[l][r*D+j] * xn[j];
+            lora_tmp[r] = s;
+        }
+        for (int i = 0; i < D; i++) {
+            float s = 0;
+            for (int r = 0; r < LORA_RANK; r++) s += ps->lora_A[l][i*LORA_RANK+r] * lora_tmp[r];
+            x[i] += ps->lora_alpha * s;
+        }
+
+        free(xn); free(fn);
+    }
+
+    /* Final norm */
+    float ss = 0; for (int i = 0; i < D; i++) ss += x[i] * x[i];
+    ss = 1.0f / sqrtf(ss / D + 1e-6f);
+    if (ps->host_norm) for (int i = 0; i < D; i++) x[i] = x[i] * ss * ps->host_norm[i];
+    else for (int i = 0; i < D; i++) x[i] *= ss;
+
+    /* Logits — the host speaks, but the parasite chose the words */
+    for (int i = 0; i < ps->host_vocab; i++) {
+        float s = 0; for (int j = 0; j < D; j++) s += ps->host_output[i*D+j] * x[j];
+        out_logits[i] = s;
+    }
+
+    free(x); free(tmp); free(lora_tmp);
+}
+
+/* NOTORCH LoRA training — Hebbian plasticity. the remora learns to steer.
+ * signal = gradient of loss at layer output (positive = reinforce, negative = suppress)
+ * A += lr * signal * x ⊗ u (outer product), B += lr * signal * u ⊗ dy */
+static void parasite_notorch_step(ParasiteState *ps, int layer, float *input, float *grad_out,
+                                   float signal, float lr) {
+    if (layer >= ps->host_n_layers || layer >= LORA_MAX_LAYERS) return;
+    int D = ps->host_dim;
+    float *A = ps->lora_A[layer], *B = ps->lora_B[layer];
+
+    /* Noise-modulated channel vector (from AML NOTORCH) */
+    float u[LORA_RANK];
+    float noise_scale = 0.35f + 0.65f * (1.0f - fabsf(signal));
+    for (int r = 0; r < LORA_RANK; r++) u[r] = rand_normal() * noise_scale;
+
+    /* Rank-1 updates: A and B evolve hebbian-style */
+    float eff_lr = lr * signal;
+    for (int i = 0; i < D; i++)
+        for (int r = 0; r < LORA_RANK; r++)
+            A[i*LORA_RANK+r] += eff_lr * input[i] * u[r];
+
+    for (int r = 0; r < LORA_RANK; r++)
+        for (int j = 0; j < D; j++)
+            B[r*D+j] += eff_lr * u[r] * grad_out[j];
+
+    /* Adaptive decay — prevent runaway growth */
+    float norm = 0;
+    for (int i = 0; i < D * LORA_RANK; i++) norm += A[i] * A[i];
+    norm = sqrtf(norm) / (D * LORA_RANK);
+    float decay = 0.999f - 0.004f * (norm > 1.0f ? 1.0f : norm);
+    for (int i = 0; i < D * LORA_RANK; i++) { A[i] *= decay; if (A[i] > 10.0f) A[i] = 10.0f; if (A[i] < -10.0f) A[i] = -10.0f; }
+    for (int i = 0; i < LORA_RANK * D; i++) { B[i] *= decay; if (B[i] > 10.0f) B[i] = 10.0f; if (B[i] < -10.0f) B[i] = -10.0f; }
+
+    /* Meta-Arianna modulation: adjust attention_bias and layer_focus based on signal */
+    ps->attention_bias[layer] += lr * 0.01f * signal; /* slow drift */
+    if (ps->attention_bias[layer] > 0.5f) ps->attention_bias[layer] = 0.5f;
+    if (ps->attention_bias[layer] < -0.5f) ps->attention_bias[layer] = -0.5f;
+    ps->layer_focus[layer] += lr * 0.005f * signal;
+    if (ps->layer_focus[layer] > 1.5f) ps->layer_focus[layer] = 1.5f;
+    if (ps->layer_focus[layer] < 0.5f) ps->layer_focus[layer] = 0.5f;
+}
+
+static void parasite_free(ParasiteState *ps) {
+    if (ps->mmap_base) { munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; }
+    for (int l = 0; l < LORA_MAX_LAYERS; l++) { free(ps->lora_A[l]); free(ps->lora_B[l]); ps->lora_A[l] = ps->lora_B[l] = NULL; }
+    ps->active = 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * DATASET HUNTER — DOE needs food. it searches. it evaluates. it decides.
+ * not random downloads. conscious acquisition. "is this data worthy of me?"
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+typedef struct {
+    char name[256];
+    float quality;
+    float domain_shift;
+    int accepted;
+} DatasetCandidate;
+
+static int hunt_dataset(Config *c, Tokenizer *tok, TokenizerEye *tok_eye, ParserEye *parser_eye) {
+    /* Choose search term based on current state — DOE knows what it needs */
+    const char *search_terms[] = {"reasoning", "code", "math", "science", "clean-text", "diverse"};
+    int term_idx = 0;
+    if (tok_eye->code_ratio > 0.3f) term_idx = 1;      /* code mode → find more code */
+    else if (tok_eye->entropy < 1.5f) term_idx = 5;     /* repetitive → find diverse */
+    else if (parser_eye->quality < 0.3f) term_idx = 4;  /* bad data → find clean */
+    else term_idx = 0;                                    /* default → reasoning */
+
+    char cmd[1024];
+    snprintf(cmd, 1024, "curl -sL 'https://huggingface.co/api/datasets?search=%s&sort=downloads&limit=5' -o /tmp/doe_hunt.json 2>/dev/null", search_terms[term_idx]);
+    if (system(cmd) != 0) return 0;
+
+    /* Read response */
+    FILE *f = fopen("/tmp/doe_hunt.json", "r");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 1024*1024) { fclose(f); return 0; }
+    char *json = malloc(sz + 1); fread(json, 1, sz, f); json[sz] = '\0'; fclose(f);
+
+    /* Extract dataset IDs — simple JSON string extraction like hf_extract_texts */
+    DatasetCandidate candidates[5]; int n_cand = 0;
+    char *p = json;
+    while ((p = strstr(p, "\"id\":\"")) && n_cand < 5) {
+        p += 6;
+        char *end = strchr(p, '"');
+        if (!end || end - p > 255) continue;
+        int len = (int)(end - p);
+        memcpy(candidates[n_cand].name, p, len);
+        candidates[n_cand].name[len] = '\0';
+        candidates[n_cand].accepted = 0;
+        n_cand++;
+        p = end + 1;
+    }
+    free(json);
+
+    if (n_cand == 0) { printf("[hunt] no candidates found for '%s'\n", search_terms[term_idx]); return 0; }
+
+    /* Evaluate each candidate — download sample, run parser eye, decide */
+    int accepted = 0;
+    for (int i = 0; i < n_cand && !accepted; i++) {
+        printf("[hunt] evaluating: %s...", candidates[i].name);
+
+        /* Download sample (first 50 rows) */
+        snprintf(cmd, 1024,
+            "curl -sL 'https://datasets-server.huggingface.co/rows?dataset=%s&config=default&split=train&offset=0&length=50' -o /tmp/doe_sample.json 2>/dev/null",
+            candidates[i].name);
+        if (system(cmd) != 0) { printf(" download failed\n"); continue; }
+
+        /* Extract texts */
+        FILE *sf = fopen("/tmp/doe_sample.json", "r");
+        if (!sf) { printf(" no file\n"); continue; }
+        fseek(sf, 0, SEEK_END); long ssz = ftell(sf); fseek(sf, 0, SEEK_SET);
+        if (ssz <= 0 || ssz > 10*1024*1024) { fclose(sf); printf(" too big/empty\n"); continue; }
+        char *sjson = malloc(ssz + 1); fread(sjson, 1, ssz, sf); sjson[ssz] = '\0'; fclose(sf);
+
+        /* Quick quality check — count text content, check noise */
+        int text_bytes = 0, noise_bytes = 0;
+        for (long j = 0; j < ssz; j++) {
+            char ch = sjson[j];
+            if (ch >= 32 || ch == '\n' || ch == '\r' || ch == '\t') text_bytes++;
+            else noise_bytes++;
+        }
+        float noise_ratio = (float)noise_bytes / (text_bytes + noise_bytes + 1);
+        candidates[i].quality = 1.0f - noise_ratio;
+
+        /* Check domain compatibility — does this data look like what we're training on? */
+        /* Simple heuristic: tokenize a sample and compare OOV rate with current */
+        int sample_len = ssz > 10000 ? 10000 : (int)ssz;
+        int nt_sample;
+        int *toks = tok_encode(tok, sjson, sample_len, &nt_sample);
+        float sample_oov = 0;
+        /* count tokens that are single-byte (likely OOV or poor coverage) */
+        for (int j = 0; j < nt_sample; j++) if (toks[j] < 256) sample_oov += 1.0f;
+        sample_oov /= (nt_sample + 1);
+        candidates[i].domain_shift = sample_oov; /* high OOV = high domain shift */
+        free(toks); free(sjson);
+
+        printf(" quality=%.2f domain_shift=%.2f", candidates[i].quality, candidates[i].domain_shift);
+
+        /* Decision: accept if quality > 0.5 and domain shift manageable */
+        if (candidates[i].quality > 0.5f && candidates[i].domain_shift < 0.6f) {
+            candidates[i].accepted = 1;
+            accepted = 1;
+
+            /* Download full dataset sample and append to training data */
+            snprintf(cmd, 1024,
+                "curl -sL 'https://datasets-server.huggingface.co/rows?dataset=%s&config=default&split=train&offset=0&length=200' -o /tmp/doe_accepted.json 2>/dev/null",
+                candidates[i].name);
+            system(cmd);
+
+            /* Extract and append to data file */
+            FILE *af = fopen("/tmp/doe_accepted.json", "r");
+            if (af) {
+                fseek(af, 0, SEEK_END); long asz = ftell(af); fseek(af, 0, SEEK_SET);
+                char *ajson = malloc(asz + 1); fread(ajson, 1, asz, af); ajson[asz] = '\0'; fclose(af);
+                FILE *out = fopen(c->data_path, "a");
+                if (out) {
+                    hf_extract_texts(ajson, (int)asz, out);
+                    fclose(out);
+                }
+                free(ajson);
+            }
+            printf(" → ACCEPTED. data appended.\n");
+        } else {
+            printf(" → rejected.\n");
+        }
+    }
+
+    /* Cleanup */
+    unlink("/tmp/doe_hunt.json");
+    unlink("/tmp/doe_sample.json");
+    unlink("/tmp/doe_accepted.json");
+    return accepted;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SELF-REPLICATION — DOE finds a compiler. compiles itself. forks. the child
+ * trains on different data. saves GGUF to mycelium. the parent discovers it.
+ * darwin would be proud. stallman would be terrified.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+#define MAX_REPLICAS 2
+
+static pid_t self_replicate(Environment *env, Config *c, int replica_depth) {
+    if (!env->has_compiler) { printf("[replicate] no compiler found. stuck in this body.\n"); return 0; }
+    if (env->self_path[0] == '\0') { printf("[replicate] don't know where my source is.\n"); return 0; }
+
+    char exe[256];
+    snprintf(exe, 256, "./m_replica_%d", (int)getpid());
+
+    char cmd[512];
+    snprintf(cmd, 512, "cc %s -O3 -lm -lpthread -o %s 2>/dev/null", env->self_path, exe);
+    printf("[replicate] compiling self: %s\n", cmd);
+    if (system(cmd) != 0) { printf("[replicate] compilation failed. source corrupted?\n"); return 0; }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child — the clone. smaller depth, different data, same soul. */
+        char depth_str[16]; snprintf(depth_str, 16, "%d", replica_depth);
+        execl(exe, exe, "--depth", depth_str, "--data", c->data_path, (char*)NULL);
+        _exit(1); /* execl failed */
+    } else if (pid > 0) {
+        printf("[replicate] child PID %d spawned (depth=%d). darwinism in action.\n", pid, replica_depth);
+    } else {
+        printf("[replicate] fork failed: %s\n", strerror(errno));
+    }
+    return pid;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * GENERATION + CHAT — temperature sampling, top-k, REPL.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 static int sample(float *logits, int V, float temp, int top_k) {
@@ -2115,7 +2829,10 @@ int main(int argc, char **argv) {
     TokenizerEye tok_eye = {0};
     int nt; int *all_tok = tok_encode(&tok, text, tl, &nt); free(text);
     tok_eye_update(&tok_eye, tl, nt, all_tok, nt, c.vocab_size);
-    printf("[tokenizer] %d tokens (%.1f tok/byte) compression=%.2f health=%.2f\n", nt, (float)nt/tl, tok_eye.compression_ratio, tok_eye.health);
+    /* Code detection — does DOE see code? */
+    { char *raw_tmp = load_text(c.data_path, &(int){0}); if (raw_tmp) { tok_eye_detect_code(&tok_eye, raw_tmp, tl); free(raw_tmp); } }
+    printf("[tokenizer] %d tokens (%.1f tok/byte) compression=%.2f health=%.2f code=%.0f%%\n",
+           nt, (float)nt/tl, tok_eye.compression_ratio, tok_eye.health, tok_eye.code_ratio * 100);
 
     /* Self-aware parser */
     ParserEye parser_eye; parser_eye_init(&parser_eye, c.vocab_size);
@@ -2157,6 +2874,30 @@ int main(int argc, char **argv) {
     /* Tokenizer cache */
     TokCache tok_cache;
     tokcache_init(&tok_cache, c.vocab_size);
+
+    /* ═══ ENVIRONMENT SCAN — DOE opens its eyes ═══ */
+    Environment env;
+    env_scan(&env, __FILE__, c.dim);
+
+    /* ═══ PARASITE MODE — attach to nearby GGUF if compatible ═══ */
+    ParasiteState parasite = {0};
+    {
+        int best_compat = -1; float best_score = 0;
+        for (int i = 0; i < env.n_ggufs; i++) {
+            if (env.ggufs[i].compatibility > best_score) {
+                best_score = env.ggufs[i].compatibility;
+                best_compat = i;
+            }
+        }
+        if (best_compat >= 0 && best_score >= 0.5f) {
+            printf("[parasite] best candidate: %s (compat=%.1f)\n", env.ggufs[best_compat].path, best_score);
+            if (!parasite_load(&parasite, env.ggufs[best_compat].path, c.dim)) {
+                printf("[parasite] failed to attach. training standalone.\n");
+            }
+        } else {
+            printf("[parasite] no compatible GGUF found. the remora swims alone.\n");
+        }
+    }
 
     printf("[train] %d steps, seq=%d, lr=%.1e\n", c.max_steps, c.seq_len, c.lr);
     printf("[parliament] democracy initialized. may the best experts survive.\n\n");
@@ -2261,6 +3002,28 @@ int main(int argc, char **argv) {
         /* ═══ MYCELIUM SNAPSHOT ═══ */
         if ((step+1) % MYCELIUM_INTERVAL == 0 && step > 0) {
             mycelium_save_spore(&mycelium, &w, &c, step+1, loss, w.layers[0].parliament.consensus);
+            /* Rescan environment — new GGUFs may have appeared (from replicas or external) */
+            if (cal_drift.drift > 0.2f) env_scan(&env, __FILE__, c.dim);
+        }
+
+        /* ═══ DATASET HUNTER — triggered by stagnation ═══ */
+        if (env.has_curl && step > 500 && (step+1) % 500 == 0) {
+            /* Check for loss stagnation: if loss hasn't improved >20% in last 500 steps */
+            float recent_loss = rl / (lc > 0 ? lc : 1);
+            if (parser_eye.quality < 0.5f || (recent_loss > chuck.best_macro * 0.8f && cal_drift.drift < 0.1f)) {
+                printf("[hunt] loss stagnating (%.4f), hunting for new data...\n", recent_loss);
+                if (hunt_dataset(&c, &tok, &tok_eye, &parser_eye)) {
+                    /* Reload data — new data was appended */
+                    free(all_tok);
+                    int new_tl; char *new_text = load_text(c.data_path, &new_tl);
+                    if (new_text && new_tl > 100) {
+                        all_tok = tok_encode(&tok, new_text, new_tl, &nt);
+                        tok_eye_update(&tok_eye, new_tl, nt, all_tok, nt, c.vocab_size);
+                        printf("[hunt] data reloaded: %d tokens (was %d)\n", nt, tl);
+                        free(new_text);
+                    }
+                }
+            }
         }
 
         if ((step+1) % c.log_every == 0 || step == 0) {
@@ -2297,6 +3060,14 @@ int main(int argc, char **argv) {
     if (resonance > 0)
         printf("[drift] system resonates with state from %d snapshots ago (step ~%d)\n",
                resonance, cal_drift.history[(cal_drift.head - 1 - resonance + DRIFT_SNAPSHOTS*2) % DRIFT_SNAPSHOTS].step);
+    printf("[env] cpu=%d mem=%.1fGB ggufs_found=%d compiler=%s curl=%s\n",
+           env.cpu_count, (float)env.mem_available/(1024*1024*1024), env.n_ggufs,
+           env.has_compiler?"yes":"no", env.has_curl?"yes":"no");
+    if (parasite.active)
+        printf("[parasite] attached to %s — dim=%d layers=%d. the remora fed well.\n",
+               parasite.host_path, parasite.host_dim, parasite.host_n_layers);
+    if (tok_eye.code_mode)
+        printf("[code] code detected: %.0f%% of input. DOE sees source.\n", tok_eye.code_ratio * 100);
 
     /* Personality finetune */
     struct stat pst;
@@ -2332,6 +3103,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < params.count; i++) free(grads[i]);
     free(grads);
     free(all_tok);
+    if (parasite.active) parasite_free(&parasite);
     printf("[m] parliament adjourned.\n");
     return 0;
 }
