@@ -55,10 +55,12 @@ no `--depth` flag? DOE checks your hardware and picks the deepest model that fit
 
 | RAM | CPU | GPU | depth | params | experts |
 |-----|-----|-----|-------|--------|---------|
-| 2GB+ | any | no | 2 | ~0.8M | 4 |
+| 2GB+ | any | no | 2 | ~1.8M | 4 |
 | 2GB+ | any | no | 4 | ~8M | 4 |
-| 16GB+ | 4+ | no | 8 | ~30M | 6 |
-| 32GB+ | 4+ | no | 12 | ~60M | 8 |
+| 8GB+ | 4+ | no | 6 | ~31M | 6 |
+| 16GB+ | 4+ | no | 8 | ~67M | 6 |
+| 32GB+ | 4+ | no | 10 | ~165M | 8 |
+| 64GB+ | 4+ | no | 12 | ~283M | 8 |
 | any | any | yes | +1-2 tiers | — | GPU shifts everything up |
 
 `--depth auto` is the default. `--depth N` overrides.
@@ -88,8 +90,8 @@ dim = depth * 64 (cap 768). head_dim = 64. GQA above 384. hidden = 1.5x per expe
 
 | depth | data | params | experts | tok/s | loss | GPU | status |
 |-------|------|--------|---------|-------|------|-----|--------|
+| 2 | 22MB | 1.82M | 6 | 693 | 4.34 | A100 cuBLAS TF32 | test run, fixes verified |
 | 4 | 1MB | 7.97M | 4-8 | 126 | 4.30 | A100 cuBLAS TF32 | DONE, GGUF 22MB |
-| 8 | 23MB | ~30M | 6 | — | — | A100 cuBLAS TF32 | TRAINING |
 
 ## the components
 

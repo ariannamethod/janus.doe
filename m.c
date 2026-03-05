@@ -16,10 +16,12 @@
  *
  * depth is the only knob. turn it and watch democracy scale.
  *
- *   depth 2  → ~3M params, 4 experts, learns what committees are
- *   depth 4  → ~8M params, 6 experts, experts start specializing
- *   depth 8  → ~30M params, 8 experts, political parties form
- *   depth 12 → ~60M params, 10 experts, parliamentary democracy
+ *   depth 2  → ~1.8M params, 4 experts, learns what committees are
+ *   depth 4  → ~8.0M params, 4 experts, experts start specializing
+ *   depth 6  → ~31M params, 6 experts, coalitions emerge
+ *   depth 8  → ~67M params, 6 experts, political parties form
+ *   depth 10 → ~165M params, 8 experts, full political spectrum
+ *   depth 12 → ~283M params, 8 experts, parliamentary democracy
  *
  * what happens when you run it:
  * 1. loads or generates data (HF API / parquet / synthetic shame)
@@ -150,7 +152,7 @@ static Config config_from_depth(int depth) {
     c.hidden_dim = ((c.hidden_dim + 63) / 64) * 64;
     c.seq_len = 256; c.norm_eps = 1e-5f; c.rope_theta = 10000.0f;
     c.attn_clamp = 30.0f; c.aux_loss_w = 0.01f;
-    c.lr = 3e-4f; c.batch_size = 4; c.warmup_steps = 100;
+    c.lr = 1e-4f; c.batch_size = 4; c.warmup_steps = 500;
     c.weight_decay = 0.01f; c.log_every = 20;
     /* max_steps computed later from actual token count — see post-tokenization */
     c.max_steps = 0; /* 0 = auto from data */
@@ -216,7 +218,7 @@ static void seg_free(SegArr*a){for(int i=0;i<a->len;i++)free(a->segs[i].data);fr
 
 static SegArr unicode_segment(const char*text,int text_len){SegArr r={0};if(!text||text_len==0)return r;unsigned char buf[4096];int bl=0;char cc=0;const unsigned char*p=(const unsigned char*)text;for(int i=0;i<text_len;i++){char cat=byte_category(p[i]);if(cat!=cc&&bl>0){seg_push(&r,buf,bl);bl=0;}cc=cat;if(bl<(int)sizeof(buf)-1)buf[bl++]=p[i];else{seg_push(&r,buf,bl);bl=0;buf[bl++]=p[i];}}if(bl>0)seg_push(&r,buf,bl);return r;}
 
-#define PAIR_CAP 32768
+#define PAIR_CAP 131072
 typedef struct{char a[64];char b[64];int count;int used;}PairEntry;
 static unsigned int pair_hash(const char*a,const char*b){unsigned int h=5381;for(const char*p=a;*p;p++)h=h*33+(unsigned char)*p;h=h*33+0xFF;for(const char*p=b;*p;p++)h=h*33+(unsigned char)*p;return h;}
 
@@ -834,7 +836,7 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
                 float *qt = la->q + t*qd + h*hd;
                 float *att = la->attn_sc + (t * c->n_heads + h) * T;
                 for (int sp = 0; sp <= t; sp++) { float *ks = la->k + sp*kv + kvh*hd; float dot = 0; for (int d = 0; d < hd; d++) dot += qt[d]*ks[d]; att[sp] = dot*sc; }
-                if (c->attn_clamp > 0) { float inv = 1.0f / c->attn_clamp; for (int sp = 0; sp <= t; sp++) att[sp] = c->attn_clamp * tanhf(att[sp]*inv); }
+                /* attn_clamp removed from training — backward lacks dtanh. See moe.c audit */
                 float mx = -1e30f; for (int sp = 0; sp <= t; sp++) if (att[sp] > mx) mx = att[sp];
                 float se = 0; for (int sp = 0; sp <= t; sp++) { att[sp] = expf(att[sp]-mx); se += att[sp]; }
                 for (int sp = 0; sp <= t; sp++) att[sp] /= se; for (int sp = t+1; sp < T; sp++) att[sp] = 0;
@@ -1346,11 +1348,11 @@ static void chuck_step(ChuckState *ck, ChuckLayer *cl, int n_layers, float lr, f
 
     /* ═══ Apply Adam with Chuck modulation ═══ */
     float eff_lr = lr * lambda_psi * ck->sigma * ck->lr_scale;
-    /* Per-tensor clipping first */
-    for (int i = 0; i < params->count; i++) {
-        float tgn = 0; for (int j = 0; j < params->tensors[i]->size; j++) tgn += grads[i][j] * grads[i][j]; tgn = sqrtf(tgn);
-        if (tgn > 10.0f) { float sc = 10.0f / tgn; for (int j = 0; j < params->tensors[i]->size; j++) grads[i][j] *= sc; }
-    }
+/* REMOVED: per-tensor clipping — causes double clip with global. See moe.c audit 2026-03-05 */
+/* REMOVED: per-tensor clipping — causes double clip with global. See moe.c audit 2026-03-05 */
+/* REMOVED: per-tensor clipping — causes double clip with global. See moe.c audit 2026-03-05 */
+/* REMOVED: per-tensor clipping — causes double clip with global. See moe.c audit 2026-03-05 */
+/* REMOVED: per-tensor clipping — causes double clip with global. See moe.c audit 2026-03-05 */
     /* Global clipping */
     float gn = 0; for (int i = 0; i < params->count; i++) for (int j = 0; j < params->tensors[i]->size; j++) gn += grads[i][j] * grads[i][j]; gn = sqrtf(gn);
     if (gn > 1.0f) { float s = 1.0f / gn; for (int i = 0; i < params->count; i++) for (int j = 0; j < params->tensors[i]->size; j++) grads[i][j] *= s; }
@@ -1362,7 +1364,7 @@ typedef struct { AdamS *states; int np; float b1,b2,eps; int t; } Adam;
 
 static Adam *adam_new(ParamList *p) {
     Adam *o = calloc(1, sizeof(Adam)); o->np = p->count; o->states = calloc(p->count, sizeof(AdamS));
-    o->b1 = 0.9f; o->b2 = 0.999f; o->eps = 1e-8f;
+    o->b1 = 0.9f; o->b2 = 0.95f; /* was 0.999, fixed 2026-03-05 */ o->eps = 1e-8f;
     for (int i = 0; i < p->count; i++) { int sz = p->tensors[i]->size; o->states[i].m = calloc(sz, 4); o->states[i].v = calloc(sz, 4); o->states[i].size = sz; }
     return o;
 }
@@ -3043,7 +3045,7 @@ int main(int argc, char **argv) {
     printf("[data] %d bytes (%.1f MB)\n", tl, (float)tl / 1048576);
 
     /* Self-aware tokenizer */
-    Tokenizer tok; tok_init(&tok); tok_train_bpe(&tok, text, tl, c.bpe_merges);
+    Tokenizer tok; tok_init(&tok); int bpe_len = tl < 2*1024*1024 ? tl : 2*1024*1024; tok_train_bpe(&tok, text, bpe_len, c.bpe_merges);
     c.vocab_size = tok.vocab_size;
     TokenizerEye tok_eye = {0};
     int nt; int *all_tok = tok_encode(&tok, text, tl, &nt); free(text);
@@ -3374,7 +3376,7 @@ int main(int argc, char **argv) {
                 if (weights_loaded || topology_changed) {
                     /* Rebuild params/grads/adam: needed after GGUF load or if last
                      * training step triggered mitosis/apoptosis (use-after-free fix) */
-                    if (!weights_loaded) { for (int i = 0; i < params.count; i++) free(grads[i]); free(grads); adam_free(opt); }
+                    { for (int i = 0; i < params.count; i++) free(grads[i]); free(grads); adam_free(opt); }
                     params = collect_params(&w, &c);
                     grads = calloc(params.count, sizeof(float*));
                     for (int i = 0; i < params.count; i++) grads[i] = calloc(params.tensors[i]->size, 4);
