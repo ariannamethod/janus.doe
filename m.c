@@ -772,7 +772,7 @@ typedef struct {
     LayerAct *layers; float *final_n, *logits, *residual;
     float *dr, *dxn, *dq, *dk, *dv, *dao, *dfxn, *dhb, *dhb2, *deo;
     float *cos_c, *sin_c; int T;
-    HarmonicState hs;
+    HarmonicState hs; float aux_loss;
 } TrainState;
 
 static TrainState alloc_ts(Config *c) {
@@ -813,6 +813,7 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
     int D = c->dim, kv = c->n_kv_heads * c->head_dim, qd = c->n_heads * c->head_dim;
     int hd = c->head_dim, hg = c->n_heads / c->n_kv_heads, H = c->hidden_dim;
     float sc = 1.0f / sqrtf((float)hd);
+    s->aux_loss = 0;
 
     for (int t = 0; t < T; t++) memcpy(s->residual + t*D, w->tok_emb->data + tokens[t]*D, D * sizeof(float));
 
@@ -871,6 +872,16 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
                 for (int i = 0; i < D; i++) mo[i] += eW * ea->proj_out[i];
             }
         }
+        /* Aux loss: load balancing across experts */
+        { float frac[MAX_EXPERTS] = {0}; int na = 0;
+          for (int e = 0; e < MAX_EXPERTS; e++) if (lw->experts[e].alive) na++;
+          for (int t = 0; t < T; t++) { int k = la->top_k[t];
+            int *ti = la->top_idx + t * MAX_EXPERTS; float *tw = la->top_wt + t * MAX_EXPERTS;
+            for (int ki = 0; ki < k; ki++) frac[ti[ki]] += tw[ki]; }
+          for (int e = 0; e < MAX_EXPERTS; e++) frac[e] /= (float)T;
+          float al = 0;
+          for (int e = 0; e < MAX_EXPERTS; e++) if (lw->experts[e].alive) al += frac[e] * frac[e];
+          s->aux_loss += c->aux_loss_w * (float)na * al; }
         for (int i = 0; i < T*D; i++) s->residual[i] += la->moe_out[i];
     }
 
@@ -885,7 +896,7 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
         float se = 0; for (int j = 0; j < c->vocab_size; j++) se += expf(lt[j] - mx);
         loss += -(lt[targets[t]] - mx - logf(se)); nv++;
     }
-    return nv > 0 ? loss / nv : 0;
+    return nv > 0 ? loss / nv + s->aux_loss : 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -963,6 +974,15 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
         memset(s->dfxn, 0, T*D*4);
         int vote_gi = gi + 6; /* w_vote gradient index */
 
+
+        /* Aux loss backward: frac[] computed once per layer */
+        float aux_frac[MAX_EXPERTS] = {0}; int aux_na = 0;
+        for (int e = 0; e < MAX_EXPERTS; e++) if (lw->experts[e].alive) aux_na++;
+        for (int tt = 0; tt < T; tt++) { int kk = la->top_k[tt];
+          for (int kki = 0; kki < kk; kki++)
+            aux_frac[la->top_idx[tt*MAX_EXPERTS+kki]] += la->top_wt[tt*MAX_EXPERTS+kki]; }
+        for (int e = 0; e < MAX_EXPERTS; e++) aux_frac[e] /= (float)T;
+
         /* Expert backward — per token, per selected expert */
         for (int t = 0; t < T; t++) {
             int k = la->top_k[t];
@@ -977,29 +997,21 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
                 ExpertAct *ea = &la->ea[t * MAX_EXPERTS + ki];
                 int egi = expert_gi[l][eI]; /* grad index for this expert's w_gate */
 
-                /* dw_down, da (hidden grad) */
+                /* dw_down + da (hidden grad) — merged single pass */
                 float *da = calloc(H, 4);
+                float *hid = NULL;
+                if (egi >= 0) {
+                    hid = calloc(H, 4);
+                    for (int j = 0; j < H; j++) hid[j] = silu_f(ea->gate_pre[j]) * ea->up_pre[j];
+                }
                 for (int i = 0; i < D; i++) {
                     float dp = eW * dm[i];
                     for (int j = 0; j < H; j++) {
                         da[j] += dp * exp->w_down->data[i*H+j];
-                        /* dw_down[i][j] += dp * ea->silu_out[j] (but silu_out = silu(gate)*up) */
-                        /* dead code removed — proper dw_down computed below (line 995) */
-                        /* actually: dw_down[i][j] = sum_t dp * hidden_act[j] */
+                        if (hid) g[egi+2][i*H+j] += dp * hid[j];
                     }
                 }
-                /* Proper dw_down: dL/dw_down[i][j] = sum over t of (eW * dm[i]) * hidden_j
-                 * where hidden_j = silu(gate_j) * up_j. We need to recompute or store it. */
-                if (egi >= 0) {
-                    /* hidden activation = silu(gate_pre) * up_pre (element-wise) */
-                    for (int i = 0; i < D; i++) {
-                        float dp = eW * dm[i];
-                        for (int j = 0; j < H; j++) {
-                            float hid_j = silu_f(ea->gate_pre[j]) * ea->up_pre[j];
-                            g[egi+2][i*H+j] += dp * hid_j;
-                        }
-                    }
-                }
+                if (hid) free(hid);
 
                 /* dgate, dup → dw_gate, dw_up */
                 for (int i = 0; i < H; i++) {
@@ -1044,6 +1056,21 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
                     g[vote_gi][eI*D+j] += dvote_buf[ki] * xn_t[j];
                 }
             }
+            /* Aux loss gradient through softmax Jacobian */
+            { float daux[MAX_EXPERTS];
+              for (int ki = 0; ki < k; ki++)
+                daux[ki] = c->aux_loss_w * (float)aux_na * 2.0f * aux_frac[ti[ki]] / (float)T;
+              float dot_aux = 0;
+              for (int ki = 0; ki < k; ki++) dot_aux += tw[ki] * daux[ki];
+              for (int ki = 0; ki < k; ki++) {
+                float dv = tw[ki] * (daux[ki] - dot_aux);
+                int eI = ti[ki];
+                float *vote_row = lw->parliament.w_vote->data + eI * D;
+                for (int j = 0; j < D; j++) {
+                    s->dfxn[t*D+j] += dv * vote_row[j];
+                    g[vote_gi][eI*D+j] += dv * xn_t[j];
+                }
+              } }
         }
         free(dmo);
 
@@ -3325,6 +3352,21 @@ int main(int argc, char **argv) {
                    cal_drift.drift, cal_drift.stability,
                    eph.expert_temperature, eph.active_layers, el);
             rl = 0; lc = 0;
+            /* Expert load distribution (from last forward pass) */
+            for (int l = 0; l < c.depth; l++) {
+                LayerAct *la = &ts.layers[l];
+                float efrac[MAX_EXPERTS] = {0};
+                for (int t = 0; t < c.seq_len; t++) {
+                    int kk = la->top_k[t];
+                    for (int ki = 0; ki < kk; ki++)
+                        efrac[la->top_idx[t*MAX_EXPERTS+ki]] += la->top_wt[t*MAX_EXPERTS+ki];
+                }
+                for (int e = 0; e < MAX_EXPERTS; e++) efrac[e] /= (float)c.seq_len;
+                printf("    L%d:", l);
+                for (int e = 0; e < MAX_EXPERTS; e++)
+                    if (w.layers[l].experts[e].alive) printf(" e%d=%.1f%%", e, efrac[e]*100.0f);
+                printf("\n");
+            }
         }
     }
     printf("\n[train] done in %.1fs — births: %d, deaths: %d, mycelium: %d spores, meta: %d entries\n",
