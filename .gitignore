@@ -1,0 +1,9 @@
+m
+m_blas
+m_data.txt
+small_data.txt
+*.gguf
+mycelium/*.gguf
+mycelium/meta.log
+blood_system.log
+*.o
