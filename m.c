@@ -21,15 +21,6 @@
  *   depth 8  → ~30M params, 8 experts, political parties form
  *   depth 12 → ~60M params, 10 experts, parliamentary democracy
  *
- * sibling of l.c (llama), moe.c (grok), lee.c (chuck VLM).
- * l.c got into university. moe.c started a committee. lee.c got self-aware.
- * m.c is what happens when the committee becomes self-aware, starts
- * breeding, and the dead members vote from beyond the grave.
- *
- * born from: moe.c backbone + nicole's ephemeral philosophy +
- * lee.c's self-awareness + AML core's harmonic resonance.
- * one file. pure C. zero deps. the most unhinged thing in the ecosystem.
- *
  * what happens when you run it:
  * 1. loads or generates data (HF API / parquet / synthetic shame)
  * 2. trains BPE tokenizer that knows its own compression ratio
