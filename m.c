@@ -126,7 +126,7 @@ typedef struct {
     int max_experts, initial_experts;
     float attn_clamp, aux_loss_w;
     float lr, weight_decay;
-    int batch_size, max_steps, warmup_steps, log_every, bpe_merges, personality_steps;
+    int batch_size, max_steps, warmup_steps, log_every, bpe_merges, personality_steps, hf_pages;
     char data_url[512], data_path[256], gguf_path[256], personality_path[256];
 } Config;
 
@@ -155,6 +155,8 @@ static Config config_from_depth(int depth) {
     /* max_steps computed later from actual token count — see post-tokenization */
     c.max_steps = 0; /* 0 = auto from data */
     c.bpe_merges = 4000; c.personality_steps = 0; /* 0 = auto from personality size */
+    /* Auto HF pages from depth: need ~30 tok/param, ~0.5MB per page, tok≈bytes/3 */
+    c.hf_pages = (depth <= 2) ? 120 : (depth <= 4) ? 500 : (depth <= 8) ? 4000 : 10000;
     snprintf(c.data_url, 512, "fineweb-edu");
     snprintf(c.data_path, 256, "m_data.txt");
     snprintf(c.gguf_path, 256, "m.gguf");
@@ -1512,23 +1514,24 @@ static int load_parquet(const char*path,const char*out_path,const char*col_name)
 }
 
 #define HF_BATCH 100
-#define HF_PAGES 50
+#define HF_PAGES_DEFAULT 50
 
 static int get_data(Config *c) {
     struct stat st;
     if (stat(c->data_path, &st) == 0 && st.st_size > 1000) { printf("[data] found %s (%.1f MB)\n", c->data_path, (float)st.st_size/1048576); return 0; }
     if (c->data_url[0]) {
-        printf("[data] fetching FineWeb-Edu from HuggingFace (%d pages)...\n", HF_PAGES);
+        int hfp = c->hf_pages > 0 ? c->hf_pages : HF_PAGES_DEFAULT;
+        printf("[data] fetching FineWeb-Edu from HuggingFace (%d pages)...\n", hfp);
         FILE *out = fopen(c->data_path, "w"); if (!out) goto synthetic;
         char tmp[280]; snprintf(tmp, sizeof(tmp), "%s.json", c->data_path); int total = 0;
-        for (int page = 0; page < HF_PAGES; page++) {
+        for (int page = 0; page < hfp; page++) {
             char cmd[1024]; snprintf(cmd, sizeof(cmd), "curl -sL 'https://datasets-server.huggingface.co/rows?dataset=HuggingFaceFW/fineweb-edu&config=sample-10BT&split=train&offset=%d&length=%d' -o '%s'", page*HF_BATCH, HF_BATCH, tmp);
             if (system(cmd) != 0) continue;
             if (stat(tmp, &st) != 0 || st.st_size < 500) continue;
             FILE *jf = fopen(tmp, "r"); if (!jf) continue;
             char *json = malloc(st.st_size+1); int jl = (int)fread(json, 1, st.st_size, jf); json[jl] = 0; fclose(jf);
             int n = hf_extract_texts(json, jl, out); free(json); total += n;
-            if ((page+1) % 10 == 0) printf("[data] page %d/%d — %d texts so far\n", page+1, HF_PAGES, total);
+            if ((page+1) % 10 == 0) printf("[data] page %d/%d — %d texts so far\n", page+1, hfp, total);
         }
         fclose(out); unlink(tmp);
         if (total > 0) { stat(c->data_path, &st); printf("[data] downloaded %d texts (%.1f MB)\n", total, (float)st.st_size/1048576); return 0; }
@@ -3004,7 +3007,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--depth") == 0 && i+1 < argc) {
             i++;
             if (strcmp(argv[i], "auto") == 0) { depth_auto = 1; }
-            else { depth = atoi(argv[i]); depth_auto = 0; }
+            else { depth = atoi(argv[i]); depth_auto = 0; if (depth < 2) depth = 2; }
         }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("m.c — Democracy of Experts. living MoE with parliamentary routing.\n\n");
@@ -3012,7 +3015,8 @@ int main(int argc, char **argv) {
             printf("  --data PATH     path to training text file\n");
             printf("  --url URL       HuggingFace dataset URL\n");
             printf("  --parquet FILE  extract text from .parquet file\n");
-            printf("  --personality   path to personality.txt for finetuning\n\n");
+            printf("  --personality   path to personality.txt for finetuning\n");
+            printf("  --pages N       HuggingFace pages to download (auto-sized to depth)\n\n");
             printf("  mycelium/       GGUF forest (auto-created, snapshots saved during training)\n");
             printf("  meta.log        meta-learning track (config→outcome history)\n\n");
             printf("  BLAS: cc m.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o m\n");
@@ -3030,6 +3034,7 @@ int main(int argc, char **argv) {
             if (load_parquet(pqf, c.data_path, "text") != 0) { fprintf(stderr, "[error] parquet load failed\n"); return 1; }
         }
         else if (strcmp(argv[i], "--personality") == 0 && i+1 < argc) snprintf(c.personality_path, 256, "%s", argv[++i]);
+        else if (strcmp(argv[i], "--pages") == 0 && i+1 < argc) c.hf_pages = atoi(argv[++i]);
     }
 
     if (get_data(&c)) { fprintf(stderr, "[error] no data\n"); return 1; }
