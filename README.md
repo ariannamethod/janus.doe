@@ -1,6 +1,6 @@
-# DEO: Democracy of Experts
+# DoE: Democracy of Experts
 
-one file. 3348 lines. pure C. zero dependencies. living MoE that breeds, kills, and votes.
+one file. C. zero dependencies. DoE breeds, kills and votes.
 
 ## what
 
@@ -18,7 +18,7 @@ a transformer where experts are born, die, and hold elections:
 
 **parameters persist. topology doesn't.** each forward pass decides how many experts are alive, how many vote, how deep to go. same weights, different architecture every time.
 
-DOE scans its environment, attaches to nearby GGUFs via LoRA (symbiont mode), hunts for datasets on HuggingFace, recognizes code in training data, finds its own weights on restart, and can replicate itself via `fork()`.
+DoE scans its environment, attaches to nearby GGUFs via LoRA (symbiont mode), hunts for datasets on HuggingFace, recognizes code in training data, finds its own weights on restart, and can replicate itself via `fork()`.
 
 no pytorch. no python. no dignity.
 
