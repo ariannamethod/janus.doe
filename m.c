@@ -1608,6 +1608,105 @@ static void export_gguf(ModelW *w, Config *c) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * GGUF LOADER — reverse of export. DOE finds its own weights and remembers.
+ * no --load flag needed. the organism recognizes itself.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+static int load_own_gguf(const char *path, ModelW *w, Config *c) {
+    FILE *f = fopen(path, "rb"); if (!f) return 0;
+    /* Read header */
+    uint32_t magic; if (fread(&magic, 4, 1, f) != 1 || magic != 0x46554747) { fclose(f); return 0; }
+    uint32_t version; fread(&version, 4, 1, f);
+    uint64_t n_tensors, n_kv; fread(&n_tensors, 8, 1, f); fread(&n_kv, 8, 1, f);
+    /* Parse KV — verify it's ours */
+    int is_ours = 0; int found_depth = 0, found_dim = 0;
+    for (uint64_t i = 0; i < n_kv; i++) {
+        uint64_t kl; fread(&kl, 8, 1, f); char key[256] = {0};
+        if (kl > 255) { fclose(f); return 0; }
+        fread(key, 1, kl, f); uint32_t vtype; fread(&vtype, 4, 1, f);
+        if (vtype == 8) { /* string */
+            uint64_t vl; fread(&vl, 8, 1, f);
+            char val[256] = {0}; int rl = vl > 255 ? 255 : (int)vl;
+            fread(val, 1, rl, f); if (vl > 255) fseek(f, vl - 255, SEEK_CUR);
+            if (strstr(key, "general.name") && strcmp(val, "m") == 0) is_ours = 1;
+        } else if (vtype == 4) { /* uint32 */
+            uint32_t val; fread(&val, 4, 1, f);
+            if (strstr(key, "block_count")) { found_depth = val; }
+            if (strstr(key, "embedding_length")) { found_dim = val; }
+        } else if (vtype == 6) { /* float32 */
+            float val; fread(&val, 4, 1, f);
+        } else { fclose(f); return 0; } /* unknown type */
+    }
+    if (!is_ours) { fclose(f); printf("[load] %s is not ours (name != 'm')\n", path); return 0; }
+    if (found_depth != c->depth || found_dim != c->dim) {
+        fclose(f); printf("[load] %s dim/depth mismatch (file: d%d dim%d, us: d%d dim%d)\n",
+                          path, found_depth, found_dim, c->depth, c->dim); return 0;
+    }
+    /* Parse tensor info — just get names and offsets */
+    typedef struct { char name[96]; uint32_t ndim; uint64_t shape[4]; uint64_t offset; uint64_t nbytes; } TI;
+    TI *tinfo = calloc(n_tensors, sizeof(TI));
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        uint64_t nl; fread(&nl, 8, 1, f);
+        if (nl > 95) { free(tinfo); fclose(f); return 0; }
+        fread(tinfo[i].name, 1, nl, f); tinfo[i].name[nl] = '\0';
+        fread(&tinfo[i].ndim, 4, 1, f);
+        uint64_t sz = 1;
+        for (uint32_t d = 0; d < tinfo[i].ndim; d++) { fread(&tinfo[i].shape[d], 8, 1, f); sz *= tinfo[i].shape[d]; }
+        uint32_t dtype; fread(&dtype, 4, 1, f); /* 0 = f32 */
+        fread(&tinfo[i].offset, 8, 1, f);
+        tinfo[i].nbytes = sz * 4;
+    }
+    /* Align to 32 bytes */
+    long hdr_end = ftell(f);
+    long data_start = ((hdr_end + 31) / 32) * 32;
+    /* Load tensors by name */
+    int loaded = 0;
+    #define LOAD_T(tensor, tname) do { \
+        for (uint64_t _i = 0; _i < n_tensors; _i++) { \
+            if (strcmp(tinfo[_i].name, tname) == 0 && (tensor) && (tensor)->size * 4 == (int)tinfo[_i].nbytes) { \
+                fseek(f, data_start + tinfo[_i].offset, SEEK_SET); \
+                fread((tensor)->data, 4, (tensor)->size, f); loaded++; break; \
+            } \
+        } \
+    } while(0)
+    LOAD_T(w->tok_emb, "token_embd.weight");
+    LOAD_T(w->output_norm, "output_norm.weight");
+    LOAD_T(w->output, "output.weight");
+    for (int l = 0; l < c->depth; l++) {
+        LayerW *lw = &w->layers[l]; char n[96];
+        snprintf(n, 96, "blk.%d.attn_norm.weight", l); LOAD_T(lw->attn_norm, n);
+        snprintf(n, 96, "blk.%d.attn_q.weight", l); LOAD_T(lw->wq, n);
+        snprintf(n, 96, "blk.%d.attn_k.weight", l); LOAD_T(lw->wk, n);
+        snprintf(n, 96, "blk.%d.attn_v.weight", l); LOAD_T(lw->wv, n);
+        snprintf(n, 96, "blk.%d.attn_output.weight", l); LOAD_T(lw->wo, n);
+        snprintf(n, 96, "blk.%d.ffn_norm.weight", l); LOAD_T(lw->ffn_norm, n);
+        snprintf(n, 96, "blk.%d.ffn_gate_inp.weight", l); LOAD_T(lw->parliament.w_vote, n);
+        for (int e = 0; e < MAX_EXPERTS; e++) {
+            snprintf(n, 96, "blk.%d.ffn_gate.%d.weight", l, e);
+            int found = 0;
+            for (uint64_t ti = 0; ti < n_tensors; ti++) {
+                if (strcmp(tinfo[ti].name, n) == 0) { found = 1; break; }
+            }
+            if (found) {
+                /* Revive this expert */
+                if (!lw->experts[e].alive) {
+                    lw->experts[e].alive = 1; lw->n_alive++;
+                    lw->experts[e].vitality = 0.8f;
+                    lw->experts[e].age = 100;
+                    lw->experts[e].frequency = 6.2831853f * e / MAX_EXPERTS;
+                }
+                LOAD_T(lw->experts[e].w_gate, n);
+                snprintf(n, 96, "blk.%d.ffn_up.%d.weight", l, e); LOAD_T(lw->experts[e].w_up, n);
+                snprintf(n, 96, "blk.%d.ffn_down.%d.weight", l, e); LOAD_T(lw->experts[e].w_down, n);
+            }
+        }
+    }
+    #undef LOAD_T
+    free(tinfo); fclose(f);
+    printf("[load] restored %d tensors from %s — DOE remembers.\n", loaded, path);
+    return loaded > 0 ? 1 : 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * MYCELIUM — the GGUF forest. during training, the system grows multiple GGUF
  * snapshots like mushrooms from mycelium. each snapshot captures a different
  * expert configuration (different population, different consensus, different
@@ -2140,7 +2239,7 @@ typedef struct {
     int dim;
     int n_heads;
     int64_t file_size;
-    float compatibility; /* 0..1 — how usable is this GGUF for parasite mode */
+    float compatibility; /* 0..1 — how usable is this GGUF for symbiont mode */
 } DiscoveredGGUF;
 
 typedef struct {
@@ -2290,7 +2389,7 @@ typedef struct {
         float *attn_norm, *ffn_norm;
     } layers[LORA_MAX_LAYERS];
 
-    /* DOE's LoRA overlays — the remora. small. trained. in control. */
+    /* DOE's LoRA overlays — the symbiont. small. trained. in control. */
     /* Delta Voice: out += alpha * A @ (B @ x) */
     float *lora_A[LORA_MAX_LAYERS];   /* [dim, rank] — output projection */
     float *lora_B[LORA_MAX_LAYERS];   /* [rank, dim] — input projection */
@@ -2300,13 +2399,13 @@ typedef struct {
 
     int active;
     char host_path[256];
-} ParasiteState;
+} SymbiontState;
 
 /* Parse GGUF tensor info entry */
 typedef struct { char name[96]; uint32_t ndim; uint64_t dims[4]; uint32_t dtype; uint64_t offset; } GGUFTensorInfo;
 
-static int parasite_load(ParasiteState *ps, const char *path, int doe_dim) {
-    memset(ps, 0, sizeof(ParasiteState));
+static int symbiont_load(SymbiontState *ps, const char *path, int doe_dim) {
+    memset(ps, 0, sizeof(SymbiontState));
     snprintf(ps->host_path, 256, "%s", path);
     ps->lora_alpha = 0.1f;
 
@@ -2405,7 +2504,7 @@ static int parasite_load(ParasiteState *ps, const char *path, int doe_dim) {
 
     /* Verify minimum viable host — can't parasitize a headless corpse */
     if (!ps->host_tok_emb || !ps->host_output || !ps->host_norm) {
-        printf("[parasite] host GGUF missing essential weights (tok=%p out=%p norm=%p). abandoning.\n",
+        printf("[symbiont] host GGUF missing essential weights (tok=%p out=%p norm=%p). abandoning.\n",
                (void*)ps->host_tok_emb, (void*)ps->host_output, (void*)ps->host_norm);
         munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; return 0;
     }
@@ -2414,7 +2513,7 @@ static int parasite_load(ParasiteState *ps, const char *path, int doe_dim) {
     for (int l = 0; l < ps->host_n_layers && l < LORA_MAX_LAYERS; l++)
         if (ps->layers[l].ffn_gate && ps->layers[l].ffn_up && ps->layers[l].ffn_down) has_standard_ffn = 1;
     if (!has_standard_ffn) {
-        printf("[parasite] host has no standard FFN layers (MoE?). parasite needs a plain transformer.\n");
+        printf("[symbiont] host has no standard FFN layers (MoE?). symbiont needs a plain transformer.\n");
         munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; return 0;
     }
 
@@ -2432,22 +2531,22 @@ static int parasite_load(ParasiteState *ps, const char *path, int doe_dim) {
     }
 
     ps->active = 1;
-    printf("[parasite] attached to %s (dim=%d layers=%d heads=%d vocab=%d, %.1fMB)\n",
+    printf("[symbiont] attached to %s (dim=%d layers=%d heads=%d vocab=%d, %.1fMB)\n",
            path, ps->host_dim, ps->host_n_layers, ps->host_heads,
            ps->host_vocab, (float)ps->mmap_size / (1024*1024));
-    printf("[parasite] LoRA rank=%d alpha=%.2f — the remora is feeding.\n", LORA_RANK, ps->lora_alpha);
+    printf("[symbiont] LoRA rank=%d alpha=%.2f — the symbiont is feeding.\n", LORA_RANK, ps->lora_alpha);
     #undef PCHECK
     return 1;
 bail:
     if (ps->mmap_base) { munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; }
-    printf("[parasite] GGUF parse failed. the remora loses its grip.\n");
+    printf("[symbiont] GGUF parse failed. the symbiont loses its grip.\n");
     return 0;
 }
 
 /* Parasite forward — run input through host model with DOE's LoRA injection.
- * the shark swims. the remora steers. nobody knows who's really in charge.
+ * the shark swims. the symbiont steers. nobody knows who's really in charge.
  * returns logits over host vocabulary. */
-static void parasite_forward(ParasiteState *ps, int token, int pos, float *out_logits,
+static void symbiont_forward(SymbiontState *ps, int token, int pos, float *out_logits,
                               float *kv_cache_k, float *kv_cache_v, int max_seq) {
     int D = ps->host_dim, H = ps->host_heads, HD = ps->host_head_dim;
     int KVH = ps->host_kv_heads, HG = H / KVH;
@@ -2479,7 +2578,7 @@ static void parasite_forward(ParasiteState *ps, int token, int pos, float *out_l
         for (int i = 0; i < kd; i++) { float s = 0; for (int j = 0; j < D; j++) s += ps->layers[l].wv[i*D+j] * xn[j]; v[i] = s; }
 
         /* RoPE on Q and K */
-        /* Inline RoPE — no precomputed cache in parasite mode */
+        /* Inline RoPE — no precomputed cache in symbiont mode */
         for (int h = 0; h < H; h++) {
             float *qh = q + h * HD; int half = HD / 2;
             for (int i = 0; i < half; i++) {
@@ -2505,7 +2604,7 @@ static void parasite_forward(ParasiteState *ps, int token, int pos, float *out_l
         memcpy(kv_cache_k + kv_off_k, k, kd * 4);
         memcpy(kv_cache_v + kv_off_v, v, kd * 4);
 
-        /* Attention with DOE bias — the parasite's grip */
+        /* Attention with DOE bias — the symbiont's grip */
         float bias = 1.0f + ps->attention_bias[l];
         float sc = 1.0f / sqrtf((float)HD);
         float *attn_out = calloc(qd, 4);
@@ -2541,7 +2640,7 @@ static void parasite_forward(ParasiteState *ps, int token, int pos, float *out_l
         for (int i = 0; i < D; i++) x[i] += ao[i];
         free(q); free(k); free(v); free(attn_out); free(ao);
 
-        /* FFN with LoRA injection — the remora feeds */
+        /* FFN with LoRA injection — the symbiont feeds */
         float *fn = calloc(D, 4);
         ss = 0; for (int i = 0; i < D; i++) ss += x[i] * x[i];
         ss = 1.0f / sqrtf(ss / D + 1e-6f);
@@ -2587,7 +2686,7 @@ static void parasite_forward(ParasiteState *ps, int token, int pos, float *out_l
     if (ps->host_norm) for (int i = 0; i < D; i++) x[i] = x[i] * ss * ps->host_norm[i];
     else for (int i = 0; i < D; i++) x[i] *= ss;
 
-    /* Logits — the host speaks, but the parasite chose the words */
+    /* Logits — the host speaks, but the symbiont chose the words */
     for (int i = 0; i < ps->host_vocab; i++) {
         float s = 0; for (int j = 0; j < D; j++) s += ps->host_output[i*D+j] * x[j];
         out_logits[i] = s;
@@ -2596,10 +2695,10 @@ static void parasite_forward(ParasiteState *ps, int token, int pos, float *out_l
     free(x); free(tmp); free(lora_tmp);
 }
 
-/* NOTORCH LoRA training — Hebbian plasticity. the remora learns to steer.
+/* NOTORCH LoRA training — Hebbian plasticity. the symbiont learns to steer.
  * signal = gradient of loss at layer output (positive = reinforce, negative = suppress)
  * A += lr * signal * x ⊗ u (outer product), B += lr * signal * u ⊗ dy */
-static void parasite_notorch_step(ParasiteState *ps, int layer, float *input, float *grad_out,
+static void symbiont_notorch_step(SymbiontState *ps, int layer, float *input, float *grad_out,
                                    float signal, float lr) {
     if (layer >= ps->host_n_layers || layer >= LORA_MAX_LAYERS) return;
     int D = ps->host_dim;
@@ -2637,7 +2736,7 @@ static void parasite_notorch_step(ParasiteState *ps, int layer, float *input, fl
     if (ps->layer_focus[layer] < 0.5f) ps->layer_focus[layer] = 0.5f;
 }
 
-static void parasite_free(ParasiteState *ps) {
+static void symbiont_free(SymbiontState *ps) {
     if (ps->mmap_base) { munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; }
     for (int l = 0; l < LORA_MAX_LAYERS; l++) { free(ps->lora_A[l]); free(ps->lora_B[l]); ps->lora_A[l] = ps->lora_B[l] = NULL; }
     ps->active = 0;
@@ -2909,6 +3008,24 @@ int main(int argc, char **argv) {
     printf("[model] depth=%d dim=%d heads=%d kv=%d hidden=%d\n", c.depth, c.dim, c.n_heads, c.n_kv_heads, c.hidden_dim);
     printf("[model] initial_experts=%d max=%d params=%.2fM\n", c.initial_experts, MAX_EXPERTS, (float)count_params(&w, &c) / 1e6f);
 
+    /* ═══ SELF-RECOGNITION — DOE looks for its own weights ═══ */
+    int weights_loaded = 0;
+    {
+        /* Try m.gguf first, then best mycelium spore */
+        const char *candidates[] = { "m.gguf", NULL, NULL, NULL };
+        int nc = 1;
+        /* Scan mycelium for own GGUFs */
+        MyceliumState ms_tmp; mycelium_init(&ms_tmp); mycelium_discover(&ms_tmp);
+        if (ms_tmp.n_spores > 0 && ms_tmp.best_idx >= 0) candidates[nc++] = ms_tmp.spores[ms_tmp.best_idx].path;
+        for (int i = 0; i < nc; i++) {
+            if (candidates[i] && load_own_gguf(candidates[i], &w, &c)) {
+                weights_loaded = 1;
+                printf("[self] DOE found itself in %s. skipping training.\n", candidates[i]);
+                break;
+            }
+        }
+    }
+
     ParamList params = collect_params(&w, &c);
     float **grads = calloc(params.count, sizeof(float*));
     for (int i = 0; i < params.count; i++) grads[i] = calloc(params.tensors[i]->size, 4);
@@ -2942,8 +3059,8 @@ int main(int argc, char **argv) {
     Environment env;
     env_scan(&env, __FILE__, c.dim);
 
-    /* ═══ PARASITE MODE — attach to nearby GGUF if compatible ═══ */
-    ParasiteState parasite = {0};
+    /* ═══ SYMBIONT MODE — attach to nearby GGUF if compatible ═══ */
+    SymbiontState symbiont = {0};
     {
         int best_compat = -1; float best_score = 0;
         for (int i = 0; i < env.n_ggufs; i++) {
@@ -2953,15 +3070,19 @@ int main(int argc, char **argv) {
             }
         }
         if (best_compat >= 0 && best_score >= 0.5f) {
-            printf("[parasite] best candidate: %s (compat=%.1f)\n", env.ggufs[best_compat].path, best_score);
-            if (!parasite_load(&parasite, env.ggufs[best_compat].path, c.dim)) {
-                printf("[parasite] failed to attach. training standalone.\n");
+            printf("[symbiont] best candidate: %s (compat=%.1f)\n", env.ggufs[best_compat].path, best_score);
+            if (!symbiont_load(&symbiont, env.ggufs[best_compat].path, c.dim)) {
+                printf("[symbiont] failed to attach. training standalone.\n");
             }
         } else {
-            printf("[parasite] no compatible GGUF found. the remora swims alone.\n");
+            printf("[symbiont] no compatible GGUF found. the symbiont swims alone.\n");
         }
     }
 
+    if (weights_loaded) {
+        printf("[self] weights loaded. skipping training. straight to parliament.\n");
+        goto skip_training;
+    }
     printf("[train] %d steps, seq=%d, lr=%.1e\n", c.max_steps, c.seq_len, c.lr);
     printf("[parliament] democracy initialized. may the best experts survive.\n\n");
     clock_t t0 = clock(); float rl = 0; int lc = 0;
@@ -3126,9 +3247,9 @@ int main(int argc, char **argv) {
     printf("[env] cpu=%d mem=%.1fGB ggufs_found=%d compiler=%s curl=%s\n",
            env.cpu_count, (float)env.mem_available/(1024*1024*1024), env.n_ggufs,
            env.has_compiler?"yes":"no", env.has_curl?"yes":"no");
-    if (parasite.active)
-        printf("[parasite] attached to %s — dim=%d layers=%d. the remora fed well.\n",
-               parasite.host_path, parasite.host_dim, parasite.host_n_layers);
+    if (symbiont.active)
+        printf("[symbiont] attached to %s — dim=%d layers=%d. the symbiont fed well.\n",
+               symbiont.host_path, symbiont.host_dim, symbiont.host_n_layers);
     if (tok_eye.code_mode)
         printf("[code] code detected: %.0f%% of input. DOE sees source.\n", tok_eye.code_ratio * 100);
 
@@ -3158,7 +3279,8 @@ int main(int argc, char **argv) {
         free(ptxt);
     } else printf("[personality] no %s found, skipping\n", c.personality_path);
 
-    export_gguf(&w, &c);
+    skip_training:
+    if (!weights_loaded) export_gguf(&w, &c);
     chat(&w, &c, &tok);
 
     adam_free(opt);
@@ -3166,7 +3288,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < params.count; i++) free(grads[i]);
     free(grads);
     free(all_tok);
-    if (parasite.active) parasite_free(&parasite);
+    if (symbiont.active) symbiont_free(&symbiont);
     printf("[m] parliament adjourned.\n");
     return 0;
 }
