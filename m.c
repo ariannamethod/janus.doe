@@ -1072,7 +1072,7 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
                 float dot_ad = 0; for (int sp = 0; sp <= t; sp++) dot_ad += att[sp] * da[sp];
                 float *qt = la->q + t*qd + h*hd; float *dqt = s->dq + t*qd + h*hd;
                 for (int sp = 0; sp <= t; sp++) {
-                    float ds = att[sp] * (da[sp] - dot_ad) * sc;
+                    float ds = att[sp] * (da[sp] - dot_ad) * sc; /* TODO: tanh clamp derivative needs pre-clamp scores stored */
                     float *ks = la->k + sp*kv + kvh*hd; float *dks = s->dk + sp*kv + kvh*hd;
                     for (int d2 = 0; d2 < hd; d2++) { dqt[d2] += ds*ks[d2]; dks[d2] += ds*qt[d2]; }
                 }
@@ -1566,7 +1566,7 @@ static void export_gguf(ModelW *w, Config *c) {
     int n_expert_tensors = 0;
     for (int l = 0; l < c->depth; l++) for (int e = 0; e < MAX_EXPERTS; e++) if (w->layers[l].experts[e].alive) n_expert_tensors += 3;
     int nt = 3 + c->depth * 7 + n_expert_tensors; /* emb + norm + output + per-layer(norm,qkvo,ffn_norm,w_vote) + expert weights */
-    w32(f, 0x46554747); w32(f, 3); w64(f, nt); w64(f, 12);
+    w32(f, 0x46554747); w32(f, 3); w64(f, nt); w64(f, 13);
     wkv_s(f, "general.architecture", "llama"); wkv_s(f, "general.name", "m");
     wkv_u(f, "llama.block_count", c->depth); wkv_u(f, "llama.embedding_length", c->dim);
     wkv_u(f, "llama.attention.head_count", c->n_heads); wkv_u(f, "llama.attention.head_count_kv", c->n_kv_heads);
@@ -1687,12 +1687,13 @@ static int load_own_gguf(const char *path, ModelW *w, Config *c) {
                 if (strcmp(tinfo[ti].name, n) == 0) { found = 1; break; }
             }
             if (found) {
-                /* Revive this expert */
+                /* Revive this expert — must allocate weights if slot was dead */
                 if (!lw->experts[e].alive) {
-                    lw->experts[e].alive = 1; lw->n_alive++;
+                    float freq = 6.2831853f * e / MAX_EXPERTS;
+                    init_expert(&lw->experts[e], c->dim, c->hidden_dim, freq, 0);
                     lw->experts[e].vitality = 0.8f;
                     lw->experts[e].age = 100;
-                    lw->experts[e].frequency = 6.2831853f * e / MAX_EXPERTS;
+                    lw->n_alive++;
                 }
                 LOAD_T(lw->experts[e].w_gate, n);
                 snprintf(n, 96, "blk.%d.ffn_up.%d.weight", l, e); LOAD_T(lw->experts[e].w_up, n);
@@ -3174,7 +3175,6 @@ int main(int argc, char **argv) {
 
         /* Adam update with Chuck's effective LR */
         float eff_lr = lr * chuck.dampen * chuck.sigma * chuck.lr_scale;
-        /* Rebuild Adam if param count changed */
         if (opt->np != params.count) { adam_free(opt); opt = adam_new(&params); }
         adam_step(opt, &params, grads, eff_lr, c.weight_decay);
 
@@ -3183,6 +3183,7 @@ int main(int argc, char **argv) {
             drift_snapshot(&cal_drift, loss, &w, &c, &tok_eye, &parser_eye, &ts.hs, &chuck, &meta);
 
         /* ═══ VITALITY + MITOSIS + APOPTOSIS (ephemeral-modulated) ═══ */
+        int prev_births = total_births, prev_deaths = total_deaths;
         /* Compute ephemeral config BEFORE life/death decisions */
         EphemeralConfig eph_pre = ephemeral_compute(&tok_eye, &parser_eye, &ts.hs,
                                                      w.layers[0].parliament.consensus, &meta, &cal_drift, c.depth);
@@ -3220,6 +3221,20 @@ int main(int argc, char **argv) {
                     break; /* one death per layer per step */
                 }
             }
+        }
+        /* Force Adam rebuild after birth/death — even if param count unchanged,
+           tensors changed identity so Adam m/v states would be stale */
+        int step_births = total_births - prev_births, step_deaths = total_deaths - prev_deaths;
+        if (step_births > 0 || step_deaths > 0) {
+            int old_np = opt->np;
+            /* Rebuild params to reflect new expert topology */
+            free(params.tensors);
+            for (int i = 0; i < params.count; i++) free(grads[i]);
+            free(grads);
+            params = collect_params(&w, &c);
+            grads = calloc(params.count, sizeof(float*));
+            for (int i = 0; i < params.count; i++) grads[i] = calloc(params.tensors[i]->size, 4);
+            if (old_np != params.count) { adam_free(opt); opt = adam_new(&params); }
         }
 
         /* ═══ EPHEMERAL CONFIG ═══ */
@@ -3306,33 +3321,41 @@ int main(int argc, char **argv) {
     if (tok_eye.code_mode)
         printf("[code] code detected: %.0f%% of input. DOE sees source.\n", tok_eye.code_ratio * 100);
 
-    /* Personality finetune */
-    struct stat pst;
-    if (stat(c.personality_path, &pst) == 0 && pst.st_size > 10) {
-        printf("[personality] found %s, finetuning...\n", c.personality_path);
-        int pl; char *ptxt = load_text(c.personality_path, &pl);
-        if (ptxt && pl > 10) {
-            int pnt; int *ptok = tok_encode(&tok, ptxt, pl, &pnt);
-            for (int step = 0; step < c.personality_steps && pnt > c.seq_len + 1; step++) {
-                int ps = (int)(rand_uniform() * (pnt - c.seq_len - 1));
-                float loss = train_fwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len);
-                free(params.tensors); for (int i = 0; i < params.count; i++) free(grads[i]); free(grads);
-                params = collect_params(&w, &c);
-                grads = calloc(params.count, sizeof(float*));
-                for (int i = 0; i < params.count; i++) grads[i] = calloc(params.tensors[i]->size, 4);
-                train_bwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len, grads);
-                float gn = 0; for (int i = 0; i < params.count; i++) for (int j = 0; j < params.tensors[i]->size; j++) gn += grads[i][j]*grads[i][j]; gn = sqrtf(gn);
-                if (gn > 1.0f) { float s = 1.0f/gn; for (int i = 0; i < params.count; i++) for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= s; }
-                if (opt->np != params.count) { adam_free(opt); opt = adam_new(&params); }
-                adam_step(opt, &params, grads, c.lr * 0.1f, c.weight_decay);
-                if ((step+1) % 20 == 0) printf("  personality step %d/%d  loss=%.4f\n", step+1, c.personality_steps, loss);
-            }
-            free(ptok);
-        }
-        free(ptxt);
-    } else printf("[personality] no %s found, skipping\n", c.personality_path);
-
     skip_training:
+    /* Personality finetune — runs even if weights loaded from GGUF */
+    {
+        struct stat pst;
+        if (stat(c.personality_path, &pst) == 0 && pst.st_size > 10) {
+            printf("[personality] found %s, finetuning...\n", c.personality_path);
+            int pl; char *ptxt = load_text(c.personality_path, &pl);
+            if (ptxt && pl > 10) {
+                int pnt; int *ptok = tok_encode(&tok, ptxt, pl, &pnt);
+                if (weights_loaded) {
+                    /* Need fresh params/grads/opt for finetune after GGUF load */
+                    params = collect_params(&w, &c);
+                    grads = calloc(params.count, sizeof(float*));
+                    for (int i = 0; i < params.count; i++) grads[i] = calloc(params.tensors[i]->size, 4);
+                    opt = adam_new(&params);
+                }
+                for (int step = 0; step < c.personality_steps && pnt > c.seq_len + 1; step++) {
+                    int ps = (int)(rand_uniform() * (pnt - c.seq_len - 1));
+                    float ploss = train_fwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len);
+                    free(params.tensors); for (int i = 0; i < params.count; i++) free(grads[i]); free(grads);
+                    params = collect_params(&w, &c);
+                    grads = calloc(params.count, sizeof(float*));
+                    for (int i = 0; i < params.count; i++) grads[i] = calloc(params.tensors[i]->size, 4);
+                    train_bwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len, grads);
+                    float gn = 0; for (int i = 0; i < params.count; i++) for (int j = 0; j < params.tensors[i]->size; j++) gn += grads[i][j]*grads[i][j]; gn = sqrtf(gn);
+                    if (gn > 1.0f) { float s = 1.0f/gn; for (int i = 0; i < params.count; i++) for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= s; }
+                    if (opt->np != params.count) { adam_free(opt); opt = adam_new(&params); }
+                    adam_step(opt, &params, grads, c.lr * 0.1f, c.weight_decay);
+                    if ((step+1) % 20 == 0) printf("  personality step %d/%d  loss=%.4f\n", step+1, c.personality_steps, ploss);
+                }
+                free(ptok);
+            }
+            free(ptxt);
+        } else if (c.personality_path[0]) printf("[personality] no %s found, skipping\n", c.personality_path);
+    }
     if (!weights_loaded) export_gguf(&w, &c);
     chat(&w, &c, &tok);
 
