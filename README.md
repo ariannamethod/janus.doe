@@ -1,9 +1,5 @@
 # m.c — Darwinism of Experts
-
-**the 4th horseman of the C quartet. the one that breeds.**
-
-siblings: [l.c](https://github.com/ariannamethod/actually.llama) (went to university), [moe.c](https://github.com/ariannamethod/moe) (started a committee), [lee.c](https://github.com/ariannamethod/chuck-optimizer) (got self-aware).
-
+  
 m.c is what happens when the committee becomes self-aware, starts breeding, and the dead members vote from beyond the grave.
 
 ## what is this
