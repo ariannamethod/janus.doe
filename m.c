@@ -110,7 +110,7 @@
 #define CHUCK_EPS 1e-8f
 #define CHUCK_PSI_CAP 0.3f
 #define CHUCK_PSI_HALF 100.0f
-#define CHUCK_MACRO_INT 50
+#define CHUCK_MACRO_INT 500
 #define CHUCK_MACRO_PAT 3
 #define CHUCK_MACRO_DECAY 0.7f
 #define CHUCK_REC_CD 20
@@ -155,7 +155,7 @@ static Config config_from_depth(int depth) {
     long pe = 12L*depth*c.dim*c.dim + (long)c.initial_experts*3*c.dim*c.hidden_dim*depth;
     c.max_steps = (int)(pe * 6 / (c.batch_size * c.seq_len));
     if (c.max_steps < 200) c.max_steps = 200;
-    if (c.max_steps > 2000) c.max_steps = 2000;
+    if (c.max_steps > 30000) c.max_steps = 30000;
     c.bpe_merges = 4000; c.personality_steps = 100;
     snprintf(c.data_url, 512, "fineweb-edu");
     snprintf(c.data_path, 256, "m_data.txt");
@@ -1311,7 +1311,7 @@ static void chuck_step(ChuckState *ck, ChuckLayer *cl, int n_layers, float lr, f
     if (ck->global_step % CHUCK_MACRO_INT == 0 && ck->global_step > CHUCK_WINDOW) {
         if (ck->macro_ema > ck->best_macro * 0.999f) {
             ck->macro_stag++;
-            if (ck->macro_stag >= CHUCK_MACRO_PAT) { ck->lr_scale *= CHUCK_MACRO_DECAY; if (ck->lr_scale < 0.05f) ck->lr_scale = 0.05f; ck->macro_stag = 0; ck->macro_drops++; }
+            if (ck->macro_stag >= CHUCK_MACRO_PAT) { ck->lr_scale *= CHUCK_MACRO_DECAY; if (ck->lr_scale < 0.15f) ck->lr_scale = 0.15f; ck->macro_stag = 0; ck->macro_drops++; }
         } else { ck->best_macro = ck->macro_ema; ck->macro_stag = 0; }
     }
 
