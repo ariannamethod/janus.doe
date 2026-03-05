@@ -2972,8 +2972,7 @@ static int auto_depth(void) {
     /* Training memory estimate: weights×4 (w+grad+m+v) + activations (batch×seq×dim×depth)
      *   d4/8M: ~200MB train, d8/30M: ~750MB, d12/60M: ~1.5GB
      *   Conservative: need 4GB free for d8, 8GB+ for d12 */
-    int depth = 2;
-    if (mem_mb >= 2048)   depth = 4;
+    int depth = 4; /* minimum useful depth — depth 2 is only for unit tests */
     if (mem_mb >= 16384)  depth = 8;  /* 16GB+ for depth 8 */
     if (mem_mb >= 32768)  depth = 12; /* 32GB+ for depth 12 */
     if (has_gpu) { /* GPU changes the game */
