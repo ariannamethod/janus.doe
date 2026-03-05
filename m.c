@@ -62,6 +62,7 @@
  * pytorch has 47 config files. we have one integer and a political system.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 #define MAX_EXPERTS 16
+#define MAX_LAYERS 32
 #define MIN_EXPERTS 2
 #define CHUCK_WINDOW 16
 #define CHUCK_DAMP_LO 0.5f
@@ -795,6 +796,7 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
     int D = c->dim, kv = c->n_kv_heads * c->head_dim, qd = c->n_heads * c->head_dim;
     int hd = c->head_dim, H = c->hidden_dim, hg = c->n_heads / c->n_kv_heads, V = c->vocab_size;
     float sc = 1.0f / sqrtf((float)hd);
+    int *layer_gi = NULL;
     int nv = 0; for (int t = 0; t < T; t++) if (targets[t] >= 0) nv++;
     if (nv == 0) goto done;
     float inv_n = 1.0f / (float)nv;
@@ -818,11 +820,37 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
     rn_bwd(s->dr, g[2], dfn, s->residual, w->output_norm->data, T, D, c->norm_eps);
     free(dfn); free(dl);
 
+    /* Precompute gradient index offsets per layer — because expert count varies.
+     * collect_params layout: [tok_emb, output, output_norm, layer0(7 fixed + n_alive*3), layer1(...), ...] */
+    layer_gi = calloc(c->depth, sizeof(int));
+    {
+        int off = 3;
+        for (int l = 0; l < c->depth; l++) {
+            layer_gi[l] = off;
+            off += 7; /* attn_norm, wq, wk, wv, wo, ffn_norm, w_vote */
+            for (int e = 0; e < MAX_EXPERTS; e++)
+                if (w->layers[l].experts[e].alive) off += 3; /* w_gate, w_up, w_down */
+        }
+    }
+
+    /* Build expert→grad_index map per layer (which slot in g[] for each expert's weights) */
+    int expert_gi[MAX_LAYERS][MAX_EXPERTS]; /* gi of w_gate for expert e; w_up=gi+1, w_down=gi+2 */
+    for (int l = 0; l < c->depth; l++) {
+        int off = layer_gi[l] + 7;
+        for (int e = 0; e < MAX_EXPERTS; e++) {
+            if (w->layers[l].experts[e].alive) {
+                expert_gi[l][e] = off;
+                off += 3;
+            } else {
+                expert_gi[l][e] = -1;
+            }
+        }
+    }
+
     /* Layers in reverse */
     for (int l = c->depth - 1; l >= 0; l--) {
         LayerW *lw = &w->layers[l]; LayerAct *la = &s->layers[l];
-        /* gradient index: tok_emb(0), output(1), output_norm(2), then per-layer */
-        int gi = 3 + l * (6 + 1); /* attn_norm, wq, wk, wv, wo, ffn_norm, w_vote */
+        int gi = layer_gi[l];
 
         /* MoE backward through variable-k parliament */
         float *dmo = calloc(T*D, 4);
@@ -843,24 +871,45 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
                 int eI = ti[ki]; float eW = tw[ki];
                 Expert *exp = &lw->experts[eI];
                 ExpertAct *ea = &la->ea[t * MAX_EXPERTS + ki];
-                /* No separate grad arrays per expert — accumulate into expert weight grads inline */
+                int egi = expert_gi[l][eI]; /* grad index for this expert's w_gate */
+
+                /* dw_down, da (hidden grad) */
                 float *da = calloc(H, 4);
                 for (int i = 0; i < D; i++) {
                     float dp = eW * dm[i];
                     for (int j = 0; j < H; j++) {
                         da[j] += dp * exp->w_down->data[i*H+j];
-                        /* dw_down accumulated: we'll handle with param collection */
+                        /* dw_down[i][j] += dp * ea->silu_out[j] (but silu_out = silu(gate)*up) */
+                        if (egi >= 0) g[egi+2][i*H+j] += dp * ea->proj_out[i] ? 0 : 0;
+                        /* actually: dw_down[i][j] = sum_t dp * hidden_act[j] */
                     }
                 }
+                /* Proper dw_down: dL/dw_down[i][j] = sum over t of (eW * dm[i]) * hidden_j
+                 * where hidden_j = silu(gate_j) * up_j. We need to recompute or store it. */
+                if (egi >= 0) {
+                    /* hidden activation = silu(gate_pre) * up_pre (element-wise) */
+                    for (int i = 0; i < D; i++) {
+                        float dp = eW * dm[i];
+                        for (int j = 0; j < H; j++) {
+                            float hid_j = silu_f(ea->gate_pre[j]) * ea->up_pre[j];
+                            g[egi+2][i*H+j] += dp * hid_j;
+                        }
+                    }
+                }
+
+                /* dgate, dup → dw_gate, dw_up */
                 for (int i = 0; i < H; i++) {
                     float gp = ea->gate_pre[i], up = ea->up_pre[i];
                     float gd = silu_bwd(gp); float act = silu_f(gp);
                     float dg = da[i] * up * gd, du = da[i] * act;
+                    /* dx (input gradient) */
                     for (int j = 0; j < D; j++) s->dfxn[t*D+j] += dg * exp->w_gate->data[i*D+j] + du * exp->w_up->data[i*D+j];
-                    /* Accumulate weight grads for living experts */
-                    for (int j = 0; j < D; j++) {
-                        exp->w_gate->data[i*D+j] -= 0; /* placeholder — real grads via param list */
-                        exp->w_up->data[i*D+j] -= 0;
+                    /* Expert weight gradients — accumulated into correct g[] slots */
+                    if (egi >= 0) {
+                        for (int j = 0; j < D; j++) {
+                            g[egi][i*D+j] += dg * xn_t[j];     /* dw_gate */
+                            g[egi+1][i*D+j] += du * xn_t[j];   /* dw_up */
+                        }
                     }
                 }
                 free(da);
@@ -945,6 +994,7 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
     /* Embedding bwd */
     for (int t = 0; t < T; t++) { float *de = g[0] + tokens[t]*D; float *dr = s->dr + t*D; for (int i = 0; i < D; i++) de[i] += dr[i]; }
 done:
+    free(layer_gi);
     free(s->logits); s->logits = NULL; free(s->final_n); s->final_n = NULL;
 }
 
