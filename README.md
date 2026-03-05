@@ -1,4 +1,4 @@
-# m.c — DeO: Democracy of Experts
+# DEO: Democracy of Experts
 
 one file. 3348 lines. pure C. zero dependencies. living MoE that breeds, kills, and votes.
 
