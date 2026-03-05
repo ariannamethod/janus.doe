@@ -19,7 +19,9 @@ a living mixture-of-experts transformer where:
 
 **parameters persist. topology doesn't.** each forward pass decides how many experts are alive, how many vote, how deep to go. same weights, different architecture every time. the nicole principle incarnate.
 
-one file. 2296 lines. pure C. zero dependencies. no pytorch. no python. no dignity.
+**v2: the organism becomes autonomous.** DOE now scans its environment, parasitizes nearby GGUFs via LoRA, hunts for datasets on HuggingFace, recognizes code in its training data, and can replicate itself via `fork()`. it's not a model anymore. it's an agent.
+
+one file. 3109 lines. pure C. zero dependencies. no pytorch. no python. no dignity.
 
 ## quick start
 
@@ -44,16 +46,20 @@ cc m.c -O3 -lm -lpthread -DUSE_BLAS -lopenblas -o m                            #
 
 ## what happens when you run it
 
-1. loads or generates data (HuggingFace API / Parquet / synthetic shame)
-2. trains BPE tokenizer that **knows its own compression ratio**
-3. builds ephemeral MoE with living experts
-4. trains with hand-written analytical gradients through variable-k parliament
-5. watches experts be born (mitosis) and die (apoptosis)
-6. grows a **mycelium of GGUF snapshots** (periodic checkpoints with fitness metrics)
-7. **meta-learns** from its own configuration choices
-8. tracks **calendar drift** — how far the present has drifted from the past
-9. finetunes on `personality.txt` (optional but psychologically recommended)
-10. exports final GGUF, drops you into chat with a parliament
+1. **scans environment** — finds GGUFs, checks resources, detects compiler/curl
+2. if compatible GGUF found → **parasitizes it** (mmap + LoRA + Meta-Arianna modulation)
+3. loads or generates data (HuggingFace API / Parquet / synthetic shame)
+4. trains BPE tokenizer that **knows its own compression ratio** and **detects code**
+5. builds ephemeral MoE with living experts
+6. trains with hand-written analytical gradients through variable-k parliament
+7. watches experts be born (mitosis) and die (apoptosis)
+8. grows a **mycelium of GGUF snapshots** (periodic checkpoints with fitness metrics)
+9. **meta-learns** from its own configuration choices
+10. tracks **calendar drift** — how far the present has drifted from the past
+11. if stagnating → **hunts for datasets** on HuggingFace (evaluates, accepts/rejects)
+12. if overloaded → **self-replicates** (compiles copy, forks, trains on different data)
+13. finetunes on `personality.txt` (optional but psychologically recommended)
+14. exports final GGUF, drops you into chat with a parliament
 
 ## depth scaling
 
@@ -95,7 +101,7 @@ m.c holds actual elections:
 - **k = floor(n_alive × (1 - consensus))** — low consensus → more experts consulted
 - softmax over the top-k selected. analytical backward through variable-size Jacobian.
 
-gerrymandering not yet implemented (TODO for v2).
+gerrymandering not yet implemented (TODO for v3).
 
 ### calendar drift
 
@@ -179,6 +185,93 @@ A[i,r] += lr × x[i] × u[r] × signal
 ```
 
 with noise channel and adaptive decay. plasticity that never stops. the brain doesn't batch either.
+
+## v2: autonomous systems
+
+DOE is no longer just a model. it's an organism that perceives its environment and acts on it.
+
+### environment scanner
+
+at startup (and periodically during training), DOE scans its surroundings:
+
+- **GGUF discovery** — `find . -name '*.gguf'` + header sniffing (magic, architecture, dim, layers)
+- **system resources** — CPU count, available RAM, free disk space
+- **capabilities** — has a C compiler? has curl? can self-replicate? can fetch data?
+- **self-awareness** — knows its own source path via `__FILE__`
+
+the scanner feeds everything else. no perception → no action.
+
+### GGUF parasite (Delta Voice + Meta-Arianna)
+
+if DOE finds a compatible GGUF nearby, it doesn't ignore it. it **parasitizes** it.
+
+```
+host model (GGUF, mmap'd, read-only)
+    ↓
+DOE wraps it with ephemeral LoRA matrices
+    ↓
+attention_biases[l] modulate each layer's attention (Meta-Arianna pattern)
+layer_focus[l] control residual stream contribution
+    ↓
+Delta Voice injection: out += α × A @ (B @ x)
+    ↓
+NOTORCH Hebbian training on LoRA only (no backward through host)
+```
+
+the host model is a tree. DOE is the mushroom. shared root system (weights), independent fruiting body (LoRA + parliament). the host doesn't know it's being parasitized.
+
+- **compatibility**: `|host_dim - doe_dim| < 128` → direct injection
+- **LoRA rank**: 16 (default), Xavier-initialized
+- **training**: Hebbian rank-1 updates with noise-modulated channel vector and adaptive decay
+- **architecture support**: llama (from l.c), will skip MoE GGUFs (can't parasitize itself)
+
+based on [Meta-Arianna](https://github.com/ariannamethod/arianna.c) observer pattern and [Delta Voice](https://github.com/ariannamethod/ariannamethod.ai) LoRA injection.
+
+### code-aware tokenizer
+
+the tokenizer now knows when it's eating code:
+
+- detects `{}`, `()`, `->`, `==`, `//`, `#include`, `#define`, semicolons, indentation
+- tracks `code_ratio` (0.0 = pure text, 1.0 = pure code)
+- `code_ratio > 0.3` → `code_mode = 1`
+- feeds into ephemeral config: code → more layers, higher complexity budget
+
+the tokenizer doesn't just compress. it **understands what it's compressing**.
+
+### dataset hunter
+
+when DOE stagnates (loss plateau + low drift + bad data quality), it goes hunting:
+
+1. searches HuggingFace API based on current state:
+   - high `code_ratio` → search for code datasets
+   - low entropy → search for diverse data
+   - bad quality → search for clean text
+   - default → search for reasoning data
+2. downloads a sample, evaluates quality via parser_eye
+3. accepts if quality > 0.5 and domain_shift < 0.6
+4. appends to training data and continues
+
+triggered every 500 steps when stagnating. requires curl in environment.
+
+### self-replication
+
+DOE can reproduce:
+
+```c
+system("cc m.c -O3 -lm -lpthread -o m_replica");
+fork();
+execl("./m_replica", "--depth", "2", "--data", other_data, NULL);
+```
+
+- requires a C compiler in the environment
+- max 2 replicas (population control)
+- each replica gets different data
+- results merge via mycelium (each saves GGUF, parent discovers them)
+
+when DOE finds multiple data sources but limited memory → spawn smaller replica.
+when DOE has multiple CPUs and is CPU-bound → parallel training.
+
+the organism reproduces. the fittest survive. darwin would approve.
 
 ## architecture
 
