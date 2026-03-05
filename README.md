@@ -1,6 +1,6 @@
 # DoE: Democracy of Experts
 
-one file. C. zero dependencies. DoE breeds, kills and votes.
+C. one file. zero dependencies. DoE breeds, kills and votes.
 
 ## what
 
