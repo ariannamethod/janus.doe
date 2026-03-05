@@ -1,4 +1,4 @@
-# m.c — Darwinism of Experts
+# m.c — Democracy of Experts
   
 m.c is what happens when the committee becomes self-aware, starts breeding, and the dead members vote from beyond the grave.
 

@@ -1,5 +1,5 @@
 /*
- * m.c — Madness of Experts. the 4th element. the unhinged one.
+ * m.c — Democracy of Experts. the 4th element. the unhinged one.
  *
  * experts are born. experts die. the parliament votes on every token.
  * the tokenizer knows it's a tokenizer. the data parser judges your data.
@@ -441,7 +441,7 @@ static void rn_bwd(float*dx,float*dw,float*dout,float*x,float*w,int T,int D,floa
  * experts aren't just weight matrices. they're organisms. they have
  * a heartbeat (vitality), a specialty (frequency in harmonic space),
  * and a lifespan. overloaded experts split. neglected experts die.
- * this is darwinism applied to feed-forward networks. darwin would approve.
+ * this is democracy applied to feed-forward networks. darwin would approve.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct {
     Tensor *w_gate, *w_up, *w_down;
@@ -2895,7 +2895,7 @@ static pid_t self_replicate(Environment *env, Config *c, int replica_depth) {
         execl(exe, exe, "--depth", depth_str, "--data", c->data_path, (char*)NULL);
         _exit(1); /* execl failed */
     } else if (pid > 0) {
-        printf("[replicate] child PID %d spawned (depth=%d). darwinism in action.\n", pid, replica_depth);
+        printf("[replicate] child PID %d spawned (depth=%d). democracy in action.\n", pid, replica_depth);
     } else {
         printf("[replicate] fork failed: %s\n", strerror(errno));
     }
@@ -2943,6 +2943,55 @@ static void chat(ModelW *w, Config *c, Tokenizer *tok) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * AUTO DEPTH — DOE sizes itself to the hardware. survival of the fittest.
+ * checks RAM, CPUs, data size. picks the deepest model that fits.
+ * the organism adapts to its environment before birth.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+static int auto_depth(void) {
+    int64_t mem_bytes = 0;
+    int cpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpus < 1) cpus = 1;
+
+#ifdef __linux__
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long psize = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && psize > 0) mem_bytes = (int64_t)pages * psize;
+#elif defined(__APPLE__)
+    int64_t physmem = 0; size_t sz = sizeof(physmem);
+    sysctlbyname("hw.memsize", &physmem, &sz, NULL, 0);
+    mem_bytes = physmem;
+#endif
+    if (mem_bytes <= 0) mem_bytes = 4LL * 1024 * 1024 * 1024; /* assume 4GB if detection fails */
+
+    int64_t mem_mb = mem_bytes / (1024 * 1024);
+    int has_gpu = 0;
+#ifdef USE_CUBLAS
+    has_gpu = 1;
+#endif
+
+    /* Training memory estimate: weights×4 (w+grad+m+v) + activations (batch×seq×dim×depth)
+     *   d4/8M: ~200MB train, d8/30M: ~750MB, d12/60M: ~1.5GB
+     *   Conservative: need 4GB free for d8, 8GB+ for d12 */
+    int depth = 2;
+    if (mem_mb >= 2048)   depth = 4;
+    if (mem_mb >= 16384)  depth = 8;  /* 16GB+ for depth 8 */
+    if (mem_mb >= 32768)  depth = 12; /* 32GB+ for depth 12 */
+    if (has_gpu) { /* GPU changes the game */
+        if (mem_mb >= 1024) depth = (depth < 4) ? 4 : depth;
+        if (mem_mb >= 4096) depth = (depth < 8) ? 8 : depth;
+        if (mem_mb >= 8192) depth = (depth < 12) ? 12 : depth;
+    }
+
+    /* CPU sanity: deep models on few CPUs = pain */
+    if (cpus <= 2 && depth > 4) depth = 4;
+    if (cpus <= 4 && depth > 8) depth = 8;
+
+    printf("[auto] RAM=%lldMB CPUs=%d GPU=%s → depth=%d\n",
+           (long long)mem_mb, cpus, has_gpu ? "yes" : "no", depth);
+    return depth;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * MAIN — the campaign trail. parse args. load data. train tokenizer.
  * build parliament. train model. watch experts live and die.
  * finetune personality. export GGUF. open the floor for questions.
@@ -2952,23 +3001,28 @@ static void chat(ModelW *w, Config *c, Tokenizer *tok) {
  * pytorch's training loop is 4 lines. ours has consciousness.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char **argv) {
-    setbuf(stdout, NULL); int depth = 4;
+    setbuf(stdout, NULL); int depth = 0; int depth_auto = 1;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--depth") == 0 && i+1 < argc) depth = atoi(argv[++i]);
+        if (strcmp(argv[i], "--depth") == 0 && i+1 < argc) {
+            i++;
+            if (strcmp(argv[i], "auto") == 0) { depth_auto = 1; }
+            else { depth = atoi(argv[i]); depth_auto = 0; }
+        }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("m.c — Madness of Experts. living MoE with parliamentary routing.\n\n");
-            printf("  --depth N      model depth (default: 4)\n");
-            printf("  --data PATH    path to training text file\n");
-            printf("  --url URL      HuggingFace dataset URL\n");
-            printf("  --parquet FILE extract text from .parquet file\n");
-            printf("  --personality  path to personality.txt for finetuning\n\n");
-            printf("  mycelium/     GGUF forest (auto-created, snapshots saved during training)\n");
-            printf("  meta.log      meta-learning track (config→outcome history)\n\n");
+            printf("m.c — Democracy of Experts. living MoE with parliamentary routing.\n\n");
+            printf("  --depth N|auto  model depth (default: auto — sizes to hardware)\n");
+            printf("  --data PATH     path to training text file\n");
+            printf("  --url URL       HuggingFace dataset URL\n");
+            printf("  --parquet FILE  extract text from .parquet file\n");
+            printf("  --personality   path to personality.txt for finetuning\n\n");
+            printf("  mycelium/       GGUF forest (auto-created, snapshots saved during training)\n");
+            printf("  meta.log        meta-learning track (config→outcome history)\n\n");
             printf("  BLAS: cc m.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o m\n");
             return 0;
         }
     }
-    printf("\n  m.c — Madness of Experts. parliament in session.\n\n");
+    if (depth_auto) depth = auto_depth();
+    printf("\n  m.c — Democracy of Experts. parliament in session.\n\n");
     Config c = config_from_depth(depth);
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--data") == 0 && i+1 < argc) snprintf(c.data_path, 256, "%s", argv[++i]);

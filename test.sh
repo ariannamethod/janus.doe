@@ -1,5 +1,5 @@
 #!/bin/bash
-# test.sh — smoke tests for m.c / DOE (Darwinism of Experts)
+# test.sh — smoke tests for m.c / DOE (Democracy of Experts)
 # the parliament demands accountability.
 
 set -e
@@ -10,7 +10,7 @@ ok() { PASS=$((PASS+1)); echo "  PASS $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL $1"; }
 
 echo ""
-echo "  DOE — Darwinism of Experts — Smoke Tests"
+echo "  DOE — Democracy of Experts — Smoke Tests"
 echo "  the parliament will now be audited."
 echo ""
 
@@ -26,7 +26,7 @@ fi
 
 # ═══ Test 3: Help flag ═══
 echo "[test] CLI..."
-./m_test --help 2>&1 | grep -q "Madness of Experts" && ok "--help" || fail "--help"
+./m_test --help 2>&1 | grep -q "Democracy of Experts" && ok "--help" || fail "--help"
 
 # ═══ Test 4: Training run ═══
 echo "[test] training (depth 2, synthetic data, ~30s)..."
