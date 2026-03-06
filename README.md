@@ -34,20 +34,42 @@ cc m.c -O3 -lm -lpthread -o m
 # or set depth manually
 ./m --depth 4
 
-# GPU acceleration (A100/H100 — TF32 tensor ops, ~25x faster)
-cc m.c -O3 -lm -lpthread -DUSE_CUBLAS -lcublas -lcudart -o m
-
-# BLAS acceleration (3-4x on CPU)
-cc m.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o m   # macOS
-cc m.c -O3 -lm -lpthread -DUSE_BLAS -lopenblas -o m                            # linux
-
 # with custom data
 ./m --data my_corpus.txt
 ./m --parquet data.parquet
 
 # with personality
 ./m --personality personality.txt
+
+# override training steps
+./m --depth 4 --data corpus.txt --steps 10000
+
+# override BPE merges (default: auto from depth)
+./m --depth 4 --data corpus.txt --bpe-merges 4000
+
+# GPU acceleration (A100/H100 — TF32 tensor ops, ~25x faster)
+cc m.c -O3 -lm -lpthread -DUSE_CUBLAS -lcublas -lcudart -o m_cublas
+
+# BLAS acceleration (3-4x on CPU)
+cc m.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o m   # macOS
+cc m.c -O3 -lm -lpthread -DUSE_BLAS -lopenblas -o m                            # linux
 ```
+
+## CLI flags
+
+| flag | default | description |
+|------|---------|-------------|
+| `--depth N` | auto | transformer depth (2/4/6/8/10/12) |
+| `--data FILE` | auto-hunt | training data (text file) |
+| `--parquet FILE` | — | training data (parquet format) |
+| `--personality FILE` | — | personality finetune data |
+| `--steps N` | auto | override max training steps |
+| `--bpe-merges N` | auto | override BPE merge count |
+| `--chat FILE` | — | inference-only mode with GGUF |
+
+`--steps` forces fresh training (skips self-recognition of existing weights).
+
+BPE merges are cached to `m_bpe.cache` — first run trains the tokenizer, subsequent runs load from cache instantly.
 
 ## autodepth
 
@@ -61,7 +83,6 @@ no `--depth` flag? DOE checks your hardware and picks the deepest model that fit
 | 16GB+ | 4+ | no | 8 | ~67M | 6 |
 | 32GB+ | 4+ | no | 10 | ~165M | 8 |
 | 64GB+ | 4+ | no | 12 | ~283M | 8 |
-| any | any | yes | +1-2 tiers | — | GPU shifts everything up |
 
 `--depth auto` is the default. `--depth N` overrides.
 
@@ -72,26 +93,35 @@ dim = depth * 64 (cap 768). head_dim = 64. GQA above 384. hidden = 1.5x per expe
 1. **auto-sizes** to hardware (RAM, CPUs, GPU detection)
 2. **scans environment** — finds GGUFs, checks resources, detects compiler/curl
 3. **checks for own weights** — if m.gguf or mycelium spore found, skips training, goes to chat
-4. if compatible GGUF found → **symbiont mode** (LoRA + Meta-Arianna modulation)
+4. if compatible GGUF found — **symbiont mode** (LoRA + Meta-Arianna modulation)
 5. loads or generates data (HuggingFace API / Parquet / synthetic)
-6. trains BPE tokenizer that **knows its own compression ratio** and **detects code**
+6. trains BPE tokenizer that **knows its own compression ratio** and **detects code** (cached to `m_bpe.cache`)
 7. builds ephemeral MoE with living experts
 8. trains with hand-written analytical gradients through variable-k parliament
 9. watches experts be born (mitosis) and die (apoptosis)
 10. grows a **mycelium of GGUF snapshots** (periodic checkpoints with fitness metrics)
 11. **meta-learns** from its own configuration choices
 12. tracks **calendar drift** — how far the present has drifted from the past
-13. if stagnating → **hunts for datasets** on HuggingFace (evaluates, accepts/rejects)
-14. if overloaded → **self-replicates** (compiles copy, forks, trains on different data)
+13. if stagnating — **hunts for datasets** on HuggingFace (evaluates, accepts/rejects)
+14. if overloaded — **self-replicates** (compiles copy, forks, trains on different data)
 15. finetunes on `personality.txt` (optional but psychologically recommended)
 16. exports final GGUF, drops you into chat with a parliament
+
+## training details
+
+- **no weight decay on embeddings** (token + positional embeddings excluded)
+- **attention clamping** in both training and inference (30*tanh(x/30)), with proper dtanh backward
+- **personality finetune**: lr = main_lr * 0.1, batch=4 grad accumulation, max 2000 steps (3 epochs)
+- **aux_loss** for expert load balancing (fraction^2 penalty with softmax Jacobian backward)
+- **mycelium checkpoints** every max(1000, max_steps/5) steps
+- **BPE cache** saved to `m_bpe.cache` — skip tokenizer training on restart
 
 ## runs
 
 | depth | data | params | experts | tok/s | loss | GPU | status |
 |-------|------|--------|---------|-------|------|-----|--------|
-| 2 | 22MB | 1.82M | 6 | 693 | 4.34 | A100 cuBLAS TF32 | test run, fixes verified |
-| 4 | 1MB | 7.97M | 4-8 | 126 | 4.30 | A100 cuBLAS TF32 | DONE, GGUF 22MB |
+| 4 | 22MB | 7.97M | 12 | 212 | 3.80 | A100 cuBLAS TF32 | done, GGUF 22MB |
+| 4 | 22MB | 7.97M | — | — | — | A100 cuBLAS TF32 | v3 training |
 
 ## the components
 
@@ -102,8 +132,8 @@ experts aren't weight matrices. they're organisms:
 - **frequency** (position in harmonic space — determines resonance)
 - **age** (steps since birth — too young to die, too old to breed)
 
-overloaded + high vitality → **mitosis** (splits in two, child inherits weights + noise)
-neglected + 8 consecutive low-vitality steps → **apoptosis** (dies, weights freed, slot recycled)
+overloaded + high vitality — **mitosis** (splits in two, child inherits weights + noise)
+neglected + 8 consecutive low-vitality steps — **apoptosis** (dies, weights freed, slot recycled)
 
 min 2, max 16 experts per layer.
 
@@ -112,7 +142,7 @@ min 2, max 16 experts per layer.
 actual elections, not top-2 dictatorship:
 - each token triggers a vote (dot product + harmonic resonance)
 - **consensus** measures how peaked the vote is (0 = chaos, 1 = unanimous)
-- **k = floor(n_alive * (1 - consensus))** — low consensus → more experts consulted
+- **k = floor(n_alive * (1 - consensus))** — low consensus — more experts consulted
 - softmax over the top-k selected. analytical backward through variable-size Jacobian.
 
 ### calendar drift
@@ -124,13 +154,13 @@ actual elections, not top-2 dictatorship:
 
 snapshot every 50 steps: expert population, consensus, loss, harmonic spectrum, tokenizer health, optimizer state. drift = normalized L2 distance.
 
-high drift → birth more experts. low drift → kill the useless. drift resonance → "i've been here before."
+high drift — birth more experts. low drift — kill the useless. drift resonance — "i've been here before."
 
 ### chuck optimizer (9 levels)
 
 from [lee.c](https://github.com/ariannamethod/chuck-optimizer). the optimizer that thinks about thinking.
 
-formula: `θ -= (α * λ_Ψ * σ * lr_scale) * m̂/(√v̂ + ε)`
+formula: `theta -= (alpha * lambda_psi * sigma * lr_scale) * m_hat/(sqrt(v_hat) + eps)`
 
 ### mycelium (GGUF forest)
 
@@ -138,8 +168,8 @@ formula: `θ -= (α * λ_Ψ * σ * lr_scale) * m̂/(√v̂ + ε)`
 mycelium/
 ├── m_s200_e6_l4.909.gguf    (fitness: 5.20)
 ├── m_s400_e6_l4.200.gguf    (fitness: 8.33)
-├── m_s1200_e8_l3.933.gguf   (fitness: 12.45)  ← best
-└── meta.log                   (configuration → outcome history)
+├── m_s1200_e8_l3.933.gguf   (fitness: 12.45)  <- best
+└── meta.log                   (configuration -> outcome history)
 ```
 
 on restart, DOE discovers existing spores and loads the fittest. no `--load` flag needed.
@@ -151,17 +181,7 @@ DOE recognizes its own weights:
 2. scans `mycelium/` for best spore (highest fitness)
 3. verifies: `general.name == "m"`, dim/depth match
 4. loads all tensors including expert weights, revives dead experts
-5. skips training → straight to chat
-
-## v2: autonomous systems
-
-### environment scanner
-
-at startup, DOE scans its surroundings:
-- **GGUF discovery** — finds nearby GGUFs + header sniffing (architecture, dim, layers)
-- **system resources** — CPU count, RAM, disk space
-- **capabilities** — has a C compiler? has curl? can self-replicate?
-- **self-awareness** — knows its own source path via `__FILE__`
+5. skips training — straight to chat
 
 ### symbiont mode (Delta Voice + Meta-Arianna)
 
@@ -169,28 +189,27 @@ if DOE finds a compatible GGUF nearby, it attaches:
 
 ```
 host model (GGUF, mmap'd, read-only)
-    ↓
+    |
 DOE wraps it with ephemeral LoRA matrices
-    ↓
+    |
 attention_biases[l] modulate each layer's attention
 layer_focus[l] control residual stream contribution
-    ↓
-Delta Voice injection: out += α * A @ (B @ x)
-    ↓
-NOTORCH Hebbian training on LoRA only (no backward through host)
+    |
+Delta Voice injection: out += alpha * A @ (B @ x)
+    |
+Hebbian training on LoRA only (no backward through host)
 ```
 
 the host model is a tree. DOE is the mycorrhiza. shared root system, independent growth.
 
-  
 ### code-aware tokenizer
 
 detects `{}`, `()`, `->`, `==`, `//`, `#include`, `#define`, semicolons, indentation.
-tracks `code_ratio` — feeds into ephemeral config: code → more layers, higher complexity budget.
+tracks `code_ratio` — feeds into ephemeral config: code — more layers, higher complexity budget.
 
 ### dataset hunter
 
-when DOE stagnates (loss plateau + low drift + bad data quality), it searches HuggingFace API. downloads sample, evaluates quality via parser_eye, accepts or rejects. triggered every 500 steps.
+when DOE stagnates (loss plateau + low drift + bad data quality), it searches HuggingFace API. downloads sample, evaluates quality via parser_eye, accepts or rejects. triggered every 500 steps. disabled when `--data` is provided.
 
 ### self-replication
 

@@ -2449,9 +2449,9 @@ static void env_scan(Environment *env, const char *self_src, int doe_dim) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * GGUF PARASITE — DOE finds a bigger model. wraps it with LoRA. controls it.
- * the smallest model that ever commanded a 7B. like a remora on a shark.
- * like a virus that makes the host cell produce more virus.
+ * GGUF SYMBIONT — DOE finds a bigger model. wraps it with LoRA. controls it.
+ * the smallest model that ever commanded a 7B. like mycorrhiza on a tree.
+ * shared root system, independent growth.
  * "i am not the model. i am the thing that tells the model what to think."
  * ═══════════════════════════════════════════════════════════════════════════════ */
 #define LORA_RANK 16
@@ -2559,7 +2559,7 @@ static int symbiont_load(SymbiontState *ps, const char *path, int doe_dim) {
     uint64_t header_size = p - ps->mmap_base;
     uint64_t data_start = ((header_size + 31) / 32) * 32;
 
-    /* Map tensor names to weight pointers — the parasitic wiring */
+    /* Map tensor names to weight pointers — the symbiont wiring */
     for (uint64_t i = 0; i < n_tensors; i++) {
         if (tinfo[i].dtype != 0) continue; /* only float32 for now */
         float *data = (float*)(ps->mmap_base + data_start + tinfo[i].offset);
@@ -2585,13 +2585,13 @@ static int symbiont_load(SymbiontState *ps, const char *path, int doe_dim) {
     }
     free(tinfo);
 
-    /* Verify minimum viable host — can't parasitize a headless corpse */
+    /* Verify minimum viable host — can't attach to a headless corpse */
     if (!ps->host_tok_emb || !ps->host_output || !ps->host_norm) {
         printf("[symbiont] host GGUF missing essential weights (tok=%p out=%p norm=%p). abandoning.\n",
                (void*)ps->host_tok_emb, (void*)ps->host_output, (void*)ps->host_norm);
         munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; return 0;
     }
-    /* Skip MoE GGUFs that have expert-specific FFN layers (can't parasitize ourselves) */
+    /* Skip MoE GGUFs that have expert-specific FFN layers (can't symbiont ourselves) */
     int has_standard_ffn = 0;
     for (int l = 0; l < ps->host_n_layers && l < LORA_MAX_LAYERS; l++)
         if (ps->layers[l].ffn_gate && ps->layers[l].ffn_up && ps->layers[l].ffn_down) has_standard_ffn = 1;
@@ -2626,8 +2626,8 @@ bail:
     return 0;
 }
 
-/* Parasite forward — run input through host model with DOE's LoRA injection.
- * the shark swims. the symbiont steers. nobody knows who's really in charge.
+/* Symbiont forward — run input through host model with DOE's LoRA injection.
+ * the tree grows. the symbiont modulates. shared root system, independent growth.
  * returns logits over host vocabulary. */
 static void symbiont_forward(SymbiontState *ps, int token, int pos, float *out_logits,
                               float *kv_cache_k, float *kv_cache_v, int max_seq) {
