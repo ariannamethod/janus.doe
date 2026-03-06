@@ -7,3 +7,5 @@ mycelium/*.gguf
 mycelium/meta.log
 blood_system.log
 *.o
+*.o
+m_test
