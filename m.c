@@ -129,6 +129,8 @@ typedef struct {
     float attn_clamp, aux_loss_w;
     float lr, weight_decay;
     int batch_size, max_steps, warmup_steps, log_every, bpe_merges, personality_steps, hf_pages;
+    int explicit_steps;  /* 1 if --steps was given on CLI */
+    int explicit_data;   /* 1 if --data was given on CLI */
     char data_url[512], data_path[256], gguf_path[256], personality_path[256];
 } Config;
 
@@ -157,6 +159,7 @@ static Config config_from_depth(int depth) {
     /* max_steps computed later from actual token count — see post-tokenization */
     c.max_steps = 0; /* 0 = auto from data */
     c.bpe_merges = 4000; c.personality_steps = 0; /* 0 = auto from personality size */
+    c.explicit_steps = 0; c.explicit_data = 0;
     /* Auto HF pages from depth: need ~30 tok/param, ~0.5MB per page, tok≈bytes/3 */
     c.hf_pages = (depth <= 2) ? 120 : (depth <= 4) ? 500 : (depth <= 8) ? 4000 : 10000;
     snprintf(c.data_url, 512, "fineweb-edu");
@@ -242,6 +245,43 @@ static void tok_train_bpe(Tokenizer*tok,const char*text,int tl,int nm){
     }
     free(pairs);for(int s=0;s<ns;s++)sa_free(&ss[s]);free(ss);
     printf("[bpe] done: %d merges, vocab=%d\n",tok->n_merges,tok->vocab_size);
+}
+
+static void tok_save_merges(Tokenizer *tok, const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%d\n", tok->n_merges);
+    for (int i = 0; i < tok->n_merges; i++)
+        fprintf(f, "%s\t%s\n", tok->merges[i].a, tok->merges[i].b);
+    fclose(f);
+    printf("[bpe] saved %d merges to %s\n", tok->n_merges, path);
+}
+
+static int tok_load_merges(Tokenizer *tok, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int nm = 0;
+    if (fscanf(f, "%d\n", &nm) != 1 || nm <= 0) { fclose(f); return 0; }
+    if (tok->merges) free(tok->merges);
+    tok->merges = calloc(nm, sizeof(MergePair));
+    tok->n_merges = 0;
+    for (int i = 0; i < nm; i++) {
+        char a[64], b[64];
+        if (fscanf(f, "%63s\t%63s\n", a, b) != 2) break;
+        strncpy(tok->merges[i].a, a, 63);
+        strncpy(tok->merges[i].b, b, 63);
+        /* Rebuild vocab: add merged token */
+        char nt[128]; snprintf(nt, 128, "%s+%s", a, b);
+        if (stoi_get(&tok->stoi, nt) < 0) {
+            tok->tokens[tok->vocab_size] = strdup(nt);
+            stoi_put(&tok->stoi, nt, tok->vocab_size);
+            tok->vocab_size++;
+        }
+        tok->n_merges++;
+    }
+    fclose(f);
+    printf("[bpe] loaded %d merges from %s (vocab=%d)\n", tok->n_merges, path, tok->vocab_size);
+    return tok->n_merges > 0;
 }
 
 static int*tok_encode(Tokenizer*tok,const char*text,int tl,int*out_len){
@@ -758,7 +798,7 @@ static float *forward_token(ModelW *w, Config *c, RunState *s, int token, int po
  * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct { float *gate_pre, *up_pre, *act_out, *proj_out; } ExpertAct;
 typedef struct {
-    float *inp, *xn, *q, *k, *v, *attn_sc, *attn_out;
+    float *inp, *xn, *q, *k, *v, *attn_sc, *attn_sc_raw, *attn_out;
     float *attn_proj, *res_aa, *ffn_xn;
     float *moe_out;
     /* Parliament state per token */
@@ -783,7 +823,7 @@ static TrainState alloc_ts(Config *c) {
         LayerAct *la = &s.layers[l];
         la->inp = calloc(T*D, 4); la->xn = calloc(T*D, 4); la->q = calloc(T*qd, 4);
         la->k = calloc(T*kv, 4); la->v = calloc(T*kv, 4);
-        la->attn_sc = calloc(T * c->n_heads * T, 4); la->attn_out = calloc(T*qd, 4);
+        la->attn_sc = calloc(T * c->n_heads * T, 4); la->attn_sc_raw = calloc(T * c->n_heads * T, 4); la->attn_out = calloc(T*qd, 4);
         la->attn_proj = calloc(T*D, 4); la->res_aa = calloc(T*D, 4); la->ffn_xn = calloc(T*D, 4);
         la->moe_out = calloc(T*D, 4);
         la->top_idx = calloc(T * MAX_EXPERTS, sizeof(int));
@@ -837,7 +877,10 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
                 float *qt = la->q + t*qd + h*hd;
                 float *att = la->attn_sc + (t * c->n_heads + h) * T;
                 for (int sp = 0; sp <= t; sp++) { float *ks = la->k + sp*kv + kvh*hd; float dot = 0; for (int d = 0; d < hd; d++) dot += qt[d]*ks[d]; att[sp] = dot*sc; }
-                /* attn_clamp removed from training — backward lacks dtanh. See moe.c audit */
+                if (c->attn_clamp > 0) { float inv = 1.0f / c->attn_clamp; for (int sp = 0; sp <= t; sp++) att[sp] = c->attn_clamp * tanhf(att[sp] * inv); }
+                /* Save post-clamp, pre-softmax scores for backward dtanh */
+                float *raw = la->attn_sc_raw + (t * c->n_heads + h) * T;
+                for (int sp = 0; sp <= t; sp++) raw[sp] = att[sp];
                 float mx = -1e30f; for (int sp = 0; sp <= t; sp++) if (att[sp] > mx) mx = att[sp];
                 float se = 0; for (int sp = 0; sp <= t; sp++) { att[sp] = expf(att[sp]-mx); se += att[sp]; }
                 for (int sp = 0; sp <= t; sp++) att[sp] /= se; for (int sp = t+1; sp < T; sp++) att[sp] = 0;
@@ -1100,8 +1143,15 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
                 }
                 float dot_ad = 0; for (int sp = 0; sp <= t; sp++) dot_ad += att[sp] * da[sp];
                 float *qt = la->q + t*qd + h*hd; float *dqt = s->dq + t*qd + h*hd;
+                float *raw = la->attn_sc_raw + (t * c->n_heads + h) * T;
                 for (int sp = 0; sp <= t; sp++) {
-                    float ds = att[sp] * (da[sp] - dot_ad) * sc; /* TODO: tanh clamp derivative needs pre-clamp scores stored */
+                    float ds = att[sp] * (da[sp] - dot_ad);
+                    /* Backward through attn_clamp: dy/dx = 1 - (y/C)^2 */
+                    if (c->attn_clamp > 0) {
+                        float yc = raw[sp] / c->attn_clamp;
+                        ds *= (1.0f - yc * yc);
+                    }
+                    ds *= sc;
                     float *ks = la->k + sp*kv + kvh*hd; float *dks = s->dk + sp*kv + kvh*hd;
                     for (int d2 = 0; d2 < hd; d2++) { dqt[d2] += ds*ks[d2]; dks[d2] += ds*qt[d2]; }
                 }
@@ -1401,8 +1451,10 @@ static void adam_step(Adam *o, ParamList *p, float **g, float lr, float wd) {
     for (int i = 0; i < o->np && i < p->count; i++) {
         Tensor *t = p->tensors[i]; float *gr = g[i]; AdamS *s = &o->states[i];
         if (s->size != t->size) continue; /* safety: expert might have been born/died */
+        /* No weight decay on embeddings: idx 0=tok_emb, 1=output (collect_params layout) */
+        int apply_wd = (wd > 0 && t->rows > 1 && i >= 2);
         for (int j = 0; j < t->size; j++) {
-            if (wd > 0 && t->rows > 1) t->data[j] -= lr * wd * t->data[j];
+            if (apply_wd) t->data[j] -= lr * wd * t->data[j];
             s->m[j] = o->b1 * s->m[j] + (1.0f-o->b1) * gr[j];
             s->v[j] = o->b2 * s->v[j] + (1.0f-o->b2) * gr[j] * gr[j];
             t->data[j] -= lr * (s->m[j]/bc1) / (sqrtf(s->v[j]/bc2) + o->eps);
@@ -1746,7 +1798,7 @@ static int load_own_gguf(const char *path, ModelW *w, Config *c) {
  * ═══════════════════════════════════════════════════════════════════════════════ */
 #define MYCELIUM_DIR "mycelium"
 #define MYCELIUM_MAX 64
-#define MYCELIUM_INTERVAL 200 /* save snapshot every N steps */
+#define MYCELIUM_INTERVAL_MIN 1000 /* save snapshot every N steps (at most 5 per training) */
 
 typedef struct {
     char path[256];
@@ -3044,6 +3096,8 @@ int main(int argc, char **argv) {
             printf("  --data PATH     path to training text file\n");
             printf("  --url URL       HuggingFace dataset URL\n");
             printf("  --parquet FILE  extract text from .parquet file\n");
+            printf("  --steps N       override max training steps (default: auto from data)\n");
+            printf("  --bpe-merges N  override BPE merge count (default: 4000)\n");
             printf("  --personality   path to personality.txt for finetuning\n");
             printf("  --pages N       HuggingFace pages to download (auto-sized to depth)\n\n");
             printf("  mycelium/       GGUF forest (auto-created, snapshots saved during training)\n");
@@ -3056,12 +3110,14 @@ int main(int argc, char **argv) {
     printf("\n  m.c — Democracy of Experts. parliament in session.\n\n");
     Config c = config_from_depth(depth);
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--data") == 0 && i+1 < argc) snprintf(c.data_path, 256, "%s", argv[++i]);
+        if (strcmp(argv[i], "--data") == 0 && i+1 < argc) { snprintf(c.data_path, 256, "%s", argv[++i]); c.explicit_data = 1; }
         else if (strcmp(argv[i], "--url") == 0 && i+1 < argc) snprintf(c.data_url, 512, "%s", argv[++i]);
         else if (strcmp(argv[i], "--parquet") == 0 && i+1 < argc) {
             const char *pqf = argv[++i]; printf("[parquet] loading %s...\n", pqf);
             if (load_parquet(pqf, c.data_path, "text") != 0) { fprintf(stderr, "[error] parquet load failed\n"); return 1; }
         }
+        else if (strcmp(argv[i], "--steps") == 0 && i+1 < argc) { c.max_steps = atoi(argv[++i]); c.explicit_steps = 1; }
+        else if (strcmp(argv[i], "--bpe-merges") == 0 && i+1 < argc) c.bpe_merges = atoi(argv[++i]);
         else if (strcmp(argv[i], "--personality") == 0 && i+1 < argc) snprintf(c.personality_path, 256, "%s", argv[++i]);
         else if (strcmp(argv[i], "--pages") == 0 && i+1 < argc) c.hf_pages = atoi(argv[++i]);
     }
@@ -3072,7 +3128,14 @@ int main(int argc, char **argv) {
     printf("[data] %d bytes (%.1f MB)\n", tl, (float)tl / 1048576);
 
     /* Self-aware tokenizer */
-    Tokenizer tok; tok_init(&tok); int bpe_len = tl < 2*1024*1024 ? tl : 2*1024*1024; tok_train_bpe(&tok, text, bpe_len, c.bpe_merges);
+    Tokenizer tok; tok_init(&tok);
+    /* Try loading cached BPE merges first */
+    if (!tok_load_merges(&tok, "m_bpe.cache") || tok.n_merges != c.bpe_merges) {
+        int bpe_len = tl < 2*1024*1024 ? tl : 2*1024*1024;
+        tok_init(&tok); /* reset if partial load */
+        tok_train_bpe(&tok, text, bpe_len, c.bpe_merges);
+        tok_save_merges(&tok, "m_bpe.cache");
+    }
     c.vocab_size = tok.vocab_size;
     TokenizerEye tok_eye = {0};
     int nt; int *all_tok = tok_encode(&tok, text, tl, &nt); free(text);
@@ -3116,11 +3179,15 @@ int main(int argc, char **argv) {
         if (c.max_steps > 500000) c.max_steps = 500000;
         printf("[auto] %.1f tok/param → %d epochs → %d steps (data=%d tok, batch=%d×%d)\n",
                tok_per_param, n_epochs, c.max_steps, nt, c.batch_size, c.seq_len);
+    } else {
+        printf("[steps] %d (explicit via --steps)\n", c.max_steps);
     }
 
     /* ═══ SELF-RECOGNITION — DOE looks for its own weights ═══ */
     int weights_loaded = 0;
-    {
+    if (c.explicit_steps) {
+        printf("[self] --steps given explicitly. ignoring existing weights. training from scratch.\n");
+    } else {
         /* Try m.gguf first, then best mycelium spore */
         const char *candidates[] = { "m.gguf", NULL, NULL, NULL };
         int nc = 1;
@@ -3174,6 +3241,9 @@ int main(int argc, char **argv) {
     {
         int best_compat = -1; float best_score = 0;
         for (int i = 0; i < env.n_ggufs; i++) {
+            /* Skip own GGUFs — m.gguf and mycelium spores */
+            if (strstr(env.ggufs[i].path, "m.gguf") || strstr(env.ggufs[i].path, "mycelium/"))
+                continue;
             if (env.ggufs[i].compatibility > best_score) {
                 best_score = env.ggufs[i].compatibility;
                 best_compat = i;
@@ -3313,14 +3383,15 @@ int main(int argc, char **argv) {
         }
 
         /* ═══ MYCELIUM SNAPSHOT ═══ */
-        if ((step+1) % MYCELIUM_INTERVAL == 0 && step > 0) {
+        { int myc_int = c.max_steps / 5; if (myc_int < MYCELIUM_INTERVAL_MIN) myc_int = MYCELIUM_INTERVAL_MIN;
+        if ((step+1) % myc_int == 0 && step > 0) {
             mycelium_save_spore(&mycelium, &w, &c, step+1, loss, w.layers[0].parliament.consensus);
             /* Rescan environment — new GGUFs may have appeared (from replicas or external) */
             if (cal_drift.drift > 0.2f) env_scan(&env, __FILE__, c.dim);
-        }
+        }}
 
-        /* ═══ DATASET HUNTER — triggered by stagnation ═══ */
-        if (env.has_curl && step > 500 && (step+1) % 500 == 0) {
+        /* ═══ DATASET HUNTER — triggered by stagnation (disabled when --data is explicit) ═══ */
+        if (env.has_curl && !c.explicit_data && step > 500 && (step+1) % 500 == 0) {
             /* Check for loss stagnation: if loss hasn't improved >20% in last 500 steps */
             float recent_loss = rl / (lc > 0 ? lc : 1);
             if (parser_eye.quality < 0.5f || (recent_loss > chuck.best_macro * 0.8f && cal_drift.drift < 0.1f)) {
@@ -3409,9 +3480,9 @@ int main(int argc, char **argv) {
                 int p_steps = c.personality_steps;
                 if (p_steps == 0) {
                     int steps_per_epoch = pnt / c.seq_len;
-                    p_steps = steps_per_epoch * 5;
+                    p_steps = steps_per_epoch * 3; /* 3 epochs over personality */
                     if (p_steps < 500) p_steps = 500;
-                    if (p_steps > 20000) p_steps = 20000;
+                    if (p_steps > 2000) p_steps = 2000;
                 }
                 printf("[personality] found %s (%d tokens), finetuning %d steps...\n",
                        c.personality_path, pnt, p_steps);
@@ -3425,12 +3496,20 @@ int main(int argc, char **argv) {
                     opt = adam_new(&params);
                     topology_changed = 0;
                 }
+                int p_batch = c.batch_size; /* same batch as training */
+                int p_ms = pnt - c.seq_len - 1; if (p_ms < 1) p_ms = 1;
                 for (int step = 0; step < p_steps && pnt > c.seq_len + 1; step++) {
-                    int ps = (int)(rand_uniform() * (pnt - c.seq_len - 1));
                     /* Zero grads */
                     for (int i = 0; i < params.count; i++) memset(grads[i], 0, params.tensors[i]->size * 4);
-                    float ploss = train_fwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len);
-                    train_bwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len, grads);
+                    float ploss = 0;
+                    for (int b = 0; b < p_batch; b++) {
+                        int ps = (int)(rand_uniform() * p_ms);
+                        ploss += train_fwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len);
+                        train_bwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len, grads);
+                    }
+                    ploss /= p_batch;
+                    float inv_pb = 1.0f / p_batch;
+                    for (int i = 0; i < params.count; i++) for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= inv_pb;
                     float gn = 0; for (int i = 0; i < params.count; i++) for (int j = 0; j < params.tensors[i]->size; j++) gn += grads[i][j]*grads[i][j]; gn = sqrtf(gn);
                     if (gn > 1.0f) { float s = 1.0f/gn; for (int i = 0; i < params.count; i++) for (int j = 0; j < params.tensors[i]->size; j++) grads[i][j] *= s; }
                     adam_step(opt, &params, grads, c.lr * 0.1f, c.weight_decay);
@@ -3441,7 +3520,7 @@ int main(int argc, char **argv) {
             free(ptxt);
         } else if (c.personality_path[0]) printf("[personality] no %s found, skipping\n", c.personality_path);
     }
-    if (!weights_loaded) export_gguf(&w, &c);
+    export_gguf(&w, &c); /* always save — training or personality may have updated weights */
     chat(&w, &c, &tok);
 
     adam_free(opt);
