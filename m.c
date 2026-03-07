@@ -926,6 +926,39 @@ static TrainState alloc_ts(Config *c) {
     return s;
 }
 
+/* SFT tokenizer: split text by <human>/<ai> tags, build token + mask arrays.
+ * mask[i]=1 means token i is AI response (compute loss), 0 means human (skip loss).
+ * If no tags found, all mask=1 (continuation mode, backwards compatible). */
+static void sft_tokenize(Tokenizer *tok, const char *text, int len,
+                          int **out_tok, int **out_mask, int *out_n) {
+    int tcap = 4096, tn = 0;
+    int *toks = malloc(tcap * sizeof(int));
+    int *mask = malloc(tcap * sizeof(int));
+    int is_ai = 0;
+    const char *p = text, *end = text + len;
+    int has_tags = (strstr(text, "<human>") || strstr(text, "<ai>"));
+    while (p < end) {
+        const char *nh = NULL, *na = NULL;
+        for (const char *s = p; s <= end - 7; s++)
+            if (memcmp(s, "<human>", 7) == 0) { nh = s; break; }
+        for (const char *s = p; s <= end - 4; s++)
+            if (memcmp(s, "<ai>", 4) == 0) { na = s; break; }
+        const char *tag = NULL; int tlen = 0, next_ai = 0;
+        if (nh && (!na || nh < na)) { tag = nh; tlen = 7; next_ai = 0; }
+        else if (na) { tag = na; tlen = 4; next_ai = 1; }
+        const char *seg_end = tag ? tag : end;
+        int seg_len = (int)(seg_end - p);
+        if (seg_len > 0) {
+            int sn; int *st = tok_encode(tok, p, seg_len, &sn);
+            while (tn + sn >= tcap) { tcap *= 2; toks = realloc(toks, tcap * sizeof(int)); mask = realloc(mask, tcap * sizeof(int)); }
+            for (int i = 0; i < sn; i++) { toks[tn] = st[i]; mask[tn] = has_tags ? is_ai : 1; tn++; }
+            free(st);
+        }
+        if (tag) { is_ai = next_ai; p = tag + tlen; } else break;
+    }
+    *out_tok = toks; *out_mask = mask; *out_n = tn;
+}
+
 static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *targets, int T) {
     int D = c->dim, kv = c->n_kv_heads * c->head_dim, qd = c->n_heads * c->head_dim;
     int hd = c->head_dim, hg = c->n_heads / c->n_kv_heads, H = c->hidden_dim;
@@ -3550,17 +3583,22 @@ int main(int argc, char **argv) {
         if (stat(c.personality_path, &pst) == 0 && pst.st_size > 10) {
             int pl; char *ptxt = load_text(c.personality_path, &pl);
             if (ptxt && pl > 10) {
-                int pnt; int *ptok = tok_encode(&tok, ptxt, pl, &pnt);
-                /* Auto personality_steps: 5 epochs over personality data */
+                int pnt; int *ptok; int *pmask;
+                sft_tokenize(&tok, ptxt, pl, &ptok, &pmask, &pnt);
+                int ai_tok = 0; for (int i = 0; i < pnt; i++) ai_tok += pmask[i];
+                int sft_mode = (ai_tok < pnt); /* has <human>/<ai> tags */
+                /* Auto personality_steps: 3 epochs over data */
                 int p_steps = c.personality_steps;
                 if (p_steps == 0) {
-                    int steps_per_epoch = pnt / c.seq_len;
-                    p_steps = steps_per_epoch * 3; /* 3 epochs over personality */
+                    int effective = sft_mode ? ai_tok : pnt; /* count only AI tokens for SFT */
+                    int steps_per_epoch = effective / c.seq_len;
+                    if (steps_per_epoch < 1) steps_per_epoch = 1;
+                    p_steps = steps_per_epoch * 3;
                     if (p_steps < 500) p_steps = 500;
                     if (p_steps > 2000) p_steps = 2000;
                 }
-                printf("[personality] found %s (%d tokens), finetuning %d steps...\n",
-                       c.personality_path, pnt, p_steps);
+                printf("[personality] found %s (%d tokens, %s mode, %d ai tokens), finetuning %d steps...\n",
+                       c.personality_path, pnt, sft_mode ? "SFT" : "continuation", ai_tok, p_steps);
                 if (weights_loaded || topology_changed) {
                     /* Rebuild params/grads/adam: needed after GGUF load or if last
                      * training step triggered mitosis/apoptosis (use-after-free fix) */
@@ -3571,16 +3609,19 @@ int main(int argc, char **argv) {
                     opt = adam_new(&params);
                     topology_changed = 0;
                 }
-                int p_batch = c.batch_size; /* same batch as training */
+                int p_batch = c.batch_size;
                 int p_ms = pnt - c.seq_len - 1; if (p_ms < 1) p_ms = 1;
+                int *sft_targets = malloc(c.seq_len * sizeof(int));
                 for (int step = 0; step < p_steps && pnt > c.seq_len + 1; step++) {
-                    /* Zero grads */
                     for (int i = 0; i < params.count; i++) memset(grads[i], 0, params.tensors[i]->size * 4);
                     float ploss = 0;
                     for (int b = 0; b < p_batch; b++) {
                         int ps = (int)(rand_uniform() * p_ms);
-                        ploss += train_fwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len);
-                        train_bwd(&w, &c, &ts, ptok+ps, ptok+ps+1, c.seq_len, grads);
+                        /* Build targets: mask human tokens (target=-1 skips loss) */
+                        for (int t = 0; t < c.seq_len; t++)
+                            sft_targets[t] = pmask[ps+t+1] ? ptok[ps+t+1] : -1;
+                        ploss += train_fwd(&w, &c, &ts, ptok+ps, sft_targets, c.seq_len);
+                        train_bwd(&w, &c, &ts, ptok+ps, sft_targets, c.seq_len, grads);
                     }
                     ploss /= p_batch;
                     float inv_pb = 1.0f / p_batch;
@@ -3590,6 +3631,8 @@ int main(int argc, char **argv) {
                     adam_step(opt, &params, grads, c.lr * 0.1f, c.weight_decay);
                     if ((step+1) % 100 == 0) printf("  personality step %d/%d  loss=%.4f\n", step+1, p_steps, ploss);
                 }
+                free(sft_targets);
+                free(pmask);
                 free(ptok);
             }
             free(ptxt);
