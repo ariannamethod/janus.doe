@@ -88,6 +88,18 @@
       }
       return d_scratch[slot];
   }
+  /* GPU weight cache — upload tensor to GPU once, skip on subsequent calls */
+  static float* gpu_ensure(float *data, int n, float **d_ptr, int *dirty) {
+      if (!*d_ptr) {
+          cudaMalloc((void**)d_ptr, (size_t)n * 4);
+          cudaMemcpy(*d_ptr, data, (size_t)n * 4, cudaMemcpyHostToDevice);
+          *dirty = 0;
+      } else if (*dirty) {
+          cudaMemcpy(*d_ptr, data, (size_t)n * 4, cudaMemcpyHostToDevice);
+          *dirty = 0;
+      }
+      return *d_ptr;
+  }
 #elif defined(USE_BLAS)
   #ifdef ACCELERATE
     #define ACCELERATE_NEW_LAPACK
@@ -398,12 +410,30 @@ static void parser_eye_update(ParserEye *eye, int *tokens, int n_tokens, const c
 /* ═══════════════════════════════════════════════════════════════════════════════
  * TENSOR — a float pointer that knows its size. still revolutionary in 2026.
  * ═══════════════════════════════════════════════════════════════════════════════ */
-typedef struct { float *data; int size, rows, cols; } Tensor;
+typedef struct {
+    float *data; int size, rows, cols;
+#ifdef USE_CUBLAS
+    float *d_data;  /* GPU-resident copy — upload once, reuse */
+    int    gpu_dirty; /* 1 = CPU changed, needs re-upload */
+#endif
+} Tensor;
 static Tensor *tnew(int s){Tensor*t=calloc(1,sizeof(Tensor));t->data=calloc(s,sizeof(float));t->size=s;t->rows=1;t->cols=s;return t;}
 static Tensor *tnew2d(int r,int co){Tensor*t=calloc(1,sizeof(Tensor));t->data=calloc(r*co,sizeof(float));t->size=r*co;t->rows=r;t->cols=co;return t;}
 static void tinit(Tensor*t,float std){for(int i=0;i<t->size;i++)t->data[i]=rand_normal()*std;}
-static void tfree(Tensor*t){if(t){free(t->data);free(t);}}
+static void tfree(Tensor*t){if(t){
+#ifdef USE_CUBLAS
+    if(t->d_data)cudaFree(t->d_data);
+#endif
+    free(t->data);free(t);}}
 static Tensor *tclone(Tensor *src){Tensor*t=calloc(1,sizeof(Tensor));t->data=malloc(src->size*sizeof(float));memcpy(t->data,src->data,src->size*sizeof(float));t->size=src->size;t->rows=src->rows;t->cols=src->cols;return t;}
+/* Mark tensor as dirty — GPU copy needs re-upload after adam step */
+static void tmark_dirty(Tensor*t){
+#ifdef USE_CUBLAS
+    if(t)t->gpu_dirty=1;
+#else
+    (void)t;
+#endif
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * MATH OPS — rmsnorm, matvec, softmax, rope, silu. the building blocks.
@@ -427,6 +457,20 @@ static void matvec(float*out,float*W,float*x,int r,int co){
     for(int i=0;i<r;i++){float s=0;float*row=W+i*co;for(int j=0;j<co;j++)s+=row[j]*x[j];out[i]=s;}
 #endif
 }
+/* matvec with GPU weight cache — W stays on GPU between calls */
+static void matvec_t(float*out,Tensor*W,float*x,int r,int co){
+#ifdef USE_CUBLAS
+    cublas_init();
+    float *dW=gpu_ensure(W->data, W->size, &W->d_data, &W->gpu_dirty);
+    float *dx=gpu_scratch(1,(size_t)co*4), *dy=gpu_scratch(2,(size_t)r*4);
+    cudaMemcpy(dx, x, (size_t)co*4, cudaMemcpyHostToDevice);
+    float a=1,b=0;
+    cublasSgemv(g_cublas, CUBLAS_OP_T, co, r, &a, dW, co, dx, 1, &b, dy, 1);
+    cudaMemcpy(out, dy, (size_t)r*4, cudaMemcpyDeviceToHost);
+#else
+    matvec(out, W->data, x, r, co);
+#endif
+}
 static void softmax_n(float*x,int n){float mx=x[0];for(int i=1;i<n;i++)if(x[i]>mx)mx=x[i];float s=0;for(int i=0;i<n;i++){x[i]=expf(x[i]-mx);s+=x[i];}for(int i=0;i<n;i++)x[i]/=s;}
 
 static void apply_rope(float*v,int pos,float*cc,float*sc,int hd){int h=hd/2,off=pos*h;for(int i=0;i<h;i++){float x0=v[i],x1=v[i+h];v[i]=x0*cc[off+i]-x1*sc[off+i];v[i+h]=x0*sc[off+i]+x1*cc[off+i];}}
@@ -439,7 +483,6 @@ static void mm_fwd(float*C,float*A,float*B,int M,int N,int K){
     float *dA=gpu_scratch(0,(size_t)M*K*4), *dB=gpu_scratch(1,(size_t)N*K*4), *dC=gpu_scratch(2,(size_t)M*N*4);
     cudaMemcpy(dA, A, (size_t)M*K*4, cudaMemcpyHostToDevice);
     cudaMemcpy(dB, B, (size_t)N*K*4, cudaMemcpyHostToDevice);
-    /* row-major C[M,N] = A[M,K] * B[N,K]^T → col-major: C_cm[N,M] = B[N,K] * A[M,K]^T */
     float a=1,b=0;
     cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &a, dB, K, dA, K, &b, dC, N);
     cudaMemcpy(C, dC, (size_t)M*N*4, cudaMemcpyDeviceToHost);
@@ -449,6 +492,20 @@ static void mm_fwd(float*C,float*A,float*B,int M,int N,int K){
     for(int m=0;m<M;m++){float*cm=C+m*N,*am=A+m*K;for(int n=0;n<N;n++){float s=0;float*bn=B+n*K;for(int k=0;k<K;k++)s+=am[k]*bn[k];cm[n]=s;}}
 #endif
 }
+/* mm_fwd with GPU weight cache — B (weight tensor) stays on GPU */
+static void mm_fwd_t(float*C,float*A,Tensor*B,int M,int N,int K){
+#ifdef USE_CUBLAS
+    cublas_init();
+    float *dB=gpu_ensure(B->data, B->size, &B->d_data, &B->gpu_dirty);
+    float *dA=gpu_scratch(0,(size_t)M*K*4), *dC=gpu_scratch(2,(size_t)M*N*4);
+    cudaMemcpy(dA, A, (size_t)M*K*4, cudaMemcpyHostToDevice);
+    float a=1,b=0;
+    cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &a, dB, K, dA, K, &b, dC, N);
+    cudaMemcpy(C, dC, (size_t)M*N*4, cudaMemcpyDeviceToHost);
+#else
+    mm_fwd(C, A, B->data, M, N, K);
+#endif
+}
 static void mm_bwd(float*dA,float*dB,float*dC,float*A,float*B,int M,int N,int K){
 #ifdef USE_CUBLAS
     cublas_init();
@@ -456,14 +513,11 @@ static void mm_bwd(float*dA,float*dB,float*dC,float*A,float*B,int M,int N,int K)
     float *ddC=gpu_scratch(0,szMN), *d_dA=gpu_scratch(1,szMK>szNK?szMK:szNK);
     float *d_other=gpu_scratch(2,szNK>szMK?szNK:szMK);
     float a=1,b1=1;
-    /* dA[M,K] += dC[M,N] * B[N,K] → col: dA^T[K,M] += B^T[K,N] * dC^T[N,M] */
     cudaMemcpy(ddC, dC, szMN, cudaMemcpyHostToDevice);
     cudaMemcpy(d_other, B, szNK, cudaMemcpyHostToDevice);
     cudaMemcpy(d_dA, dA, szMK, cudaMemcpyHostToDevice);
     cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, K, M, N, &a, d_other, N, ddC, N, &b1, d_dA, K);
     cudaMemcpy(dA, d_dA, szMK, cudaMemcpyDeviceToHost);
-    /* dB[N,K] += dC^T[N,M] * A[M,K] → col: dB^T[K,N] += A^T[K,M] * dC^T[N,M]... */
-    /* simpler: row dB[N,K] += dC^T * A. col: dB_cm[K,N] = A_cm[K,M] * dC_cm[N,M]^T */
     cudaMemcpy(d_other, A, szMK, cudaMemcpyHostToDevice);
     cudaMemcpy(d_dA, dB, szNK, cudaMemcpyHostToDevice);
     cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_T, K, N, M, &a, d_other, K, ddC, N, &b1, d_dA, K);
@@ -473,6 +527,29 @@ static void mm_bwd(float*dA,float*dB,float*dC,float*A,float*B,int M,int N,int K)
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, N, K, M, 1.0f, dC, N, A, K, 1.0f, dB, K);
 #else
     for(int m=0;m<M;m++){float*dc=dC+m*N,*am=A+m*K;for(int n=0;n<N;n++){float d=dc[n];if(d==0)continue;float*bn=B+n*K;for(int k=0;k<K;k++){dA[m*K+k]+=d*bn[k];dB[n*K+k]+=d*am[k];}}}
+#endif
+}
+/* mm_bwd with GPU weight cache — B (weight tensor) stays on GPU */
+static void mm_bwd_t(float*dA,float*dB_data,float*dC,float*A,Tensor*B,int M,int N,int K){
+#ifdef USE_CUBLAS
+    cublas_init();
+    size_t szMK=(size_t)M*K*4, szNK=(size_t)N*K*4, szMN=(size_t)M*N*4;
+    float *d_B=gpu_ensure(B->data, B->size, &B->d_data, &B->gpu_dirty);
+    float *ddC=gpu_scratch(0,szMN), *d_dA=gpu_scratch(1,szMK>szNK?szMK:szNK);
+    float a=1,b1=1;
+    /* dA[M,K] += dC[M,N] * B[N,K] */
+    cudaMemcpy(ddC, dC, szMN, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_dA, dA, szMK, cudaMemcpyHostToDevice);
+    cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, K, M, N, &a, d_B, N, ddC, N, &b1, d_dA, K);
+    cudaMemcpy(dA, d_dA, szMK, cudaMemcpyDeviceToHost);
+    /* dB[N,K] += dC^T * A */
+    float *d_other=gpu_scratch(2,szMK);
+    cudaMemcpy(d_other, A, szMK, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_dA, dB_data, szNK, cudaMemcpyHostToDevice);
+    cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_T, K, N, M, &a, d_other, K, ddC, N, &b1, d_dA, K);
+    cudaMemcpy(dB_data, d_dA, szNK, cudaMemcpyDeviceToHost);
+#else
+    mm_bwd(dA, dB_data, dC, A, B->data, M, N, K);
 #endif
 }
 static void rn_fwd(float*o,float*x,float*w,int T,int D,float eps){for(int t=0;t<T;t++){float*xt=x+t*D,*ot=o+t*D;float ss=0;for(int i=0;i<D;i++)ss+=xt[i]*xt[i];float inv=1.0f/sqrtf(ss/D+eps);for(int i=0;i<D;i++)ot[i]=xt[i]*inv*w[i];}}
@@ -746,9 +823,9 @@ static float *forward_token(ModelW *w, Config *c, RunState *s, int token, int po
         LayerW *lw = &w->layers[l];
         /* Attention */
         rmsnorm(s->xb, s->x, lw->attn_norm->data, D, c->norm_eps);
-        matvec(s->q, lw->wq->data, s->xb, c->n_heads*hd, D);
-        matvec(s->k, lw->wk->data, s->xb, c->n_kv_heads*hd, D);
-        matvec(s->v, lw->wv->data, s->xb, c->n_kv_heads*hd, D);
+        matvec_t(s->q, lw->wq, s->xb, c->n_heads*hd, D);
+        matvec_t(s->k, lw->wk, s->xb, c->n_kv_heads*hd, D);
+        matvec_t(s->v, lw->wv, s->xb, c->n_kv_heads*hd, D);
         for (int h = 0; h < c->n_heads; h++) apply_rope(s->q+h*hd, pos, s->cos_cache, s->sin_cache, hd);
         for (int h = 0; h < c->n_kv_heads; h++) apply_rope(s->k+h*hd, pos, s->cos_cache, s->sin_cache, hd);
         int co = l * c->seq_len * kd + pos * kd;
@@ -767,7 +844,7 @@ static float *forward_token(ModelW *w, Config *c, RunState *s, int token, int po
             float *xb2h = s->xb2 + h * hd; memset(xb2h, 0, hd * sizeof(float));
             for (int t = 0; t <= pos; t++) { float a = att[t]; int vo = l*c->seq_len*kd + t*kd + kvh*hd; for (int d = 0; d < hd; d++) xb2h[d] += a * s->value_cache[vo+d]; }
         }
-        matvec(s->xb, lw->wo->data, s->xb2, D, D);
+        matvec_t(s->xb, lw->wo, s->xb2, D, D);
         for (int i = 0; i < D; i++) s->x[i] += s->xb[i];
 
         /* Parliament MoE FFN */
@@ -779,16 +856,16 @@ static float *forward_token(ModelW *w, Config *c, RunState *s, int token, int po
 
         for (int ki = 0; ki < k; ki++) {
             Expert *exp = &lw->experts[selected[ki]];
-            matvec(s->hb, exp->w_gate->data, s->xb, H, D);
-            matvec(s->hb2, exp->w_up->data, s->xb, H, D);
+            matvec_t(s->hb, exp->w_gate, s->xb, H, D);
+            matvec_t(s->hb2, exp->w_up, s->xb, H, D);
             for (int i = 0; i < H; i++) { float act = silu_f(s->hb[i]); s->hb[i] = act * s->hb2[i]; }
-            matvec(s->xb2, exp->w_down->data, s->hb, D, H);
+            matvec_t(s->xb2, exp->w_down, s->hb, D, H);
             for (int i = 0; i < D; i++) s->expert_out[i] += weights[ki] * s->xb2[i];
         }
         for (int i = 0; i < D; i++) s->x[i] += s->expert_out[i];
     }
     rmsnorm(s->x, s->x, w->output_norm->data, D, c->norm_eps);
-    matvec(s->logits, w->output->data, s->x, c->vocab_size, D);
+    matvec_t(s->logits, w->output, s->x, c->vocab_size, D);
     return s->logits;
 }
 
@@ -863,9 +940,9 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
 
         /* Attention */
         rn_fwd(la->xn, s->residual, lw->attn_norm->data, T, D, c->norm_eps);
-        mm_fwd(la->q, la->xn, lw->wq->data, T, qd, D);
-        mm_fwd(la->k, la->xn, lw->wk->data, T, kv, D);
-        mm_fwd(la->v, la->xn, lw->wv->data, T, kv, D);
+        mm_fwd_t(la->q, la->xn, lw->wq, T, qd, D);
+        mm_fwd_t(la->k, la->xn, lw->wk, T, kv, D);
+        mm_fwd_t(la->v, la->xn, lw->wv, T, kv, D);
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < c->n_heads; h++) apply_rope(la->q + t*qd + h*hd, t, s->cos_c, s->sin_c, hd);
             for (int h = 0; h < c->n_kv_heads; h++) apply_rope(la->k + t*kv + h*hd, t, s->cos_c, s->sin_c, hd);
@@ -888,7 +965,7 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
                 for (int sp = 0; sp <= t; sp++) { float a = att[sp]; float *vs = la->v + sp*kv + kvh*hd; for (int d = 0; d < hd; d++) oh[d] += a*vs[d]; }
             }
         }
-        mm_fwd(la->attn_proj, la->attn_out, lw->wo->data, T, D, qd);
+        mm_fwd_t(la->attn_proj, la->attn_out, lw->wo, T, D, qd);
         for (int i = 0; i < T*D; i++) s->residual[i] += la->attn_proj[i];
         memcpy(la->res_aa, s->residual, T*D*4);
 
@@ -907,10 +984,10 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
                 int eI = ti[ki]; float eW = tw[ki];
                 Expert *exp = &lw->experts[eI];
                 ExpertAct *ea = &la->ea[t * MAX_EXPERTS + ki];
-                matvec(ea->gate_pre, exp->w_gate->data, xn_t, H, D);
-                matvec(ea->up_pre, exp->w_up->data, xn_t, H, D);
+                matvec_t(ea->gate_pre, exp->w_gate, xn_t, H, D);
+                matvec_t(ea->up_pre, exp->w_up, xn_t, H, D);
                 for (int i = 0; i < H; i++) { float act = silu_f(ea->gate_pre[i]); ea->act_out[i] = act * ea->up_pre[i]; }
-                matvec(ea->proj_out, exp->w_down->data, ea->act_out, D, H);
+                matvec_t(ea->proj_out, exp->w_down, ea->act_out, D, H);
                 float *mo = la->moe_out + t*D;
                 for (int i = 0; i < D; i++) mo[i] += eW * ea->proj_out[i];
             }
@@ -929,7 +1006,7 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
     }
 
     s->final_n = calloc(T*D, 4); rn_fwd(s->final_n, s->residual, w->output_norm->data, T, D, c->norm_eps);
-    s->logits = calloc(T * c->vocab_size, 4); mm_fwd(s->logits, s->final_n, w->output->data, T, c->vocab_size, D);
+    s->logits = calloc(T * c->vocab_size, 4); mm_fwd_t(s->logits, s->final_n, w->output, T, c->vocab_size, D);
 
     float loss = 0; int nv = 0;
     for (int t = 0; t < T; t++) {
@@ -972,7 +1049,7 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
 
     /* LM head bwd */
     float *dfn = calloc(T*D, 4);
-    mm_bwd(dfn, g[1], dl, s->final_n, w->output->data, T, V, D);
+    mm_bwd_t(dfn, g[1], dl, s->final_n, w->output, T, V, D);
     /* Final norm bwd */
     memset(s->dr, 0, T*D*4);
     rn_bwd(s->dr, g[2], dfn, s->residual, w->output_norm->data, T, D, c->norm_eps);
@@ -1125,7 +1202,7 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
         memcpy(dap, s->dr, T*D*4);
 
         memset(s->dao, 0, T*qd*4);
-        mm_bwd(s->dao, g[gi+4], dap, la->attn_out, lw->wo->data, T, D, qd);
+        mm_bwd_t(s->dao, g[gi+4], dap, la->attn_out, lw->wo, T, D, qd);
         free(dap);
 
         memset(s->dq, 0, T*qd*4); memset(s->dk, 0, T*kv*4); memset(s->dv, 0, T*kv*4);
@@ -1163,9 +1240,9 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
             for (int h = 0; h < c->n_kv_heads; h++) rope_bwd(s->dk + t*kv + h*hd, t, s->cos_c, s->sin_c, hd);
         }
         memset(s->dxn, 0, T*D*4);
-        mm_bwd(s->dxn, g[gi+1], s->dq, la->xn, lw->wq->data, T, qd, D);
-        mm_bwd(s->dxn, g[gi+2], s->dk, la->xn, lw->wk->data, T, kv, D);
-        mm_bwd(s->dxn, g[gi+3], s->dv, la->xn, lw->wv->data, T, kv, D);
+        mm_bwd_t(s->dxn, g[gi+1], s->dq, la->xn, lw->wq, T, qd, D);
+        mm_bwd_t(s->dxn, g[gi+2], s->dk, la->xn, lw->wk, T, kv, D);
+        mm_bwd_t(s->dxn, g[gi+3], s->dv, la->xn, lw->wv, T, kv, D);
 
         float *ds = calloc(T*D, 4); memcpy(ds, s->dr, T*D*4); memset(s->dr, 0, T*D*4);
         rn_bwd(s->dr, g[gi], s->dxn, la->inp, lw->attn_norm->data, T, D, c->norm_eps);
@@ -1450,8 +1527,7 @@ static void adam_step(Adam *o, ParamList *p, float **g, float lr, float wd) {
     o->t++; float bc1 = 1.0f - powf(o->b1, (float)o->t), bc2 = 1.0f - powf(o->b2, (float)o->t);
     for (int i = 0; i < o->np && i < p->count; i++) {
         Tensor *t = p->tensors[i]; float *gr = g[i]; AdamS *s = &o->states[i];
-        if (s->size != t->size) continue; /* safety: expert might have been born/died */
-        /* No weight decay on embeddings: idx 0=tok_emb, 1=output (collect_params layout) */
+        if (s->size != t->size) continue;
         int apply_wd = (wd > 0 && t->rows > 1 && i >= 2);
         for (int j = 0; j < t->size; j++) {
             if (apply_wd) t->data[j] -= lr * wd * t->data[j];
@@ -1459,6 +1535,7 @@ static void adam_step(Adam *o, ParamList *p, float **g, float lr, float wd) {
             s->v[j] = o->b2 * s->v[j] + (1.0f-o->b2) * gr[j] * gr[j];
             t->data[j] -= lr * (s->m[j]/bc1) / (sqrtf(s->v[j]/bc2) + o->eps);
         }
+        tmark_dirty(t); /* GPU copy needs re-upload */
     }
 }
 static void adam_free(Adam*o){if(!o)return;for(int i=0;i<o->np;i++){free(o->states[i].m);free(o->states[i].v);}free(o->states);free(o);}
