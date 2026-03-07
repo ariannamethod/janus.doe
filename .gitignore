@@ -1,5 +1,7 @@
 m
 m_blas
+m_cublas
+m_test
 m_data.txt
 small_data.txt
 *.gguf
@@ -7,5 +9,9 @@ mycelium/*.gguf
 mycelium/meta.log
 blood_system.log
 *.o
-*.o
-m_test
+*.bin
+m_bpe.cache
+logs/
+.DS_Store
+doe_dataset_merged.jsonl
+personality.txt

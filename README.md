@@ -1,6 +1,8 @@
 # DoE: Democracy of Experts
 
-C. one file. zero dependencies. DoE breeds, kills and votes.
+**Status: work in progress.** The foundation trains and generates. The living topology (mitosis, apoptosis, parliament) works. SFT pipeline with 7236 Q&A pairs. Next: scale up, fix loss plateau at 3.07.
+
+C. one file. ~3650 lines. zero dependencies. DoE breeds, kills and votes.
 
 ## what
 
@@ -120,8 +122,10 @@ dim = depth * 64 (cap 768). head_dim = 64. GQA above 384. hidden = 1.5x per expe
 
 | depth | data | params | experts | tok/s | loss | GPU | status |
 |-------|------|--------|---------|-------|------|-----|--------|
-| 4 | 22MB | 7.97M | 12 | 212 | 3.80 | A100 cuBLAS TF32 | done, GGUF 22MB |
-| 4 | 22MB | 7.97M | — | — | — | A100 cuBLAS TF32 | v3 training |
+| 4 | 22MB | 7.97M | 12 | 212 | **3.076** | A100 cuBLAS TF32 | done, GGUF 25MB |
+| 2 | 22MB | ~1.8M | 4 | — | 3.15 | A100 cuBLAS TF32 | done |
+
+3 training runs hit a loss plateau around 3.07. SFT pipeline added (7236 WTForacle Q&A pairs, loss masking). Next step: scale data + depth, LoRA personality.
 
 ## the components
 
