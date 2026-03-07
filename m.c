@@ -2322,7 +2322,7 @@ typedef struct {
     int dim;
     int n_heads;
     int64_t file_size;
-    float compatibility; /* 0..1 — how usable is this GGUF for symbiont mode */
+    float compatibility; /* 0..1 — how usable is this GGUF as DOE host */
 } DiscoveredGGUF;
 
 typedef struct {
@@ -2449,16 +2449,15 @@ static void env_scan(Environment *env, const char *self_src, int doe_dim) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * GGUF SYMBIONT — DOE finds a bigger model. wraps it with LoRA. controls it.
- * the smallest model that ever commanded a 7B. like mycorrhiza on a tree.
- * shared root system, independent growth.
- * "i am not the model. i am the thing that tells the model what to think."
+ * GGUF HOST — DOE indexes a bigger model. wraps it with LoRA. modulates it.
+ * DOE reads the host read-only. LoRA experts provide direction.
+ * the host provides weights. DOE provides topology.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 #define LORA_RANK 16
 #define LORA_MAX_LAYERS 32
 
 typedef struct {
-    /* Host model — mmap'd from GGUF, read-only. the shark. */
+    /* Host model — mmap'd from GGUF, read-only */
     uint8_t *mmap_base;
     size_t mmap_size;
     int host_n_layers, host_dim, host_hidden, host_heads, host_kv_heads, host_head_dim;
@@ -2472,7 +2471,7 @@ typedef struct {
         float *attn_norm, *ffn_norm;
     } layers[LORA_MAX_LAYERS];
 
-    /* DOE's LoRA overlays — the symbiont. small. trained. in control. */
+    /* DOE's LoRA overlays — small, trained, in control */
     /* Delta Voice: out += alpha * A @ (B @ x) */
     float *lora_A[LORA_MAX_LAYERS];   /* [dim, rank] — output projection */
     float *lora_B[LORA_MAX_LAYERS];   /* [rank, dim] — input projection */
@@ -2482,13 +2481,13 @@ typedef struct {
 
     int active;
     char host_path[256];
-} SymbiontState;
+} GGUFHost;
 
 /* Parse GGUF tensor info entry */
 typedef struct { char name[96]; uint32_t ndim; uint64_t dims[4]; uint32_t dtype; uint64_t offset; } GGUFTensorInfo;
 
-static int symbiont_load(SymbiontState *ps, const char *path, int doe_dim) {
-    memset(ps, 0, sizeof(SymbiontState));
+static int gguf_host_load(GGUFHost *ps, const char *path, int doe_dim) {
+    memset(ps, 0, sizeof(GGUFHost));
     snprintf(ps->host_path, 256, "%s", path);
     ps->lora_alpha = 0.1f;
 
@@ -2559,7 +2558,7 @@ static int symbiont_load(SymbiontState *ps, const char *path, int doe_dim) {
     uint64_t header_size = p - ps->mmap_base;
     uint64_t data_start = ((header_size + 31) / 32) * 32;
 
-    /* Map tensor names to weight pointers — the symbiont wiring */
+    /* Map tensor names to weight pointers */
     for (uint64_t i = 0; i < n_tensors; i++) {
         if (tinfo[i].dtype != 0) continue; /* only float32 for now */
         float *data = (float*)(ps->mmap_base + data_start + tinfo[i].offset);
@@ -2587,16 +2586,16 @@ static int symbiont_load(SymbiontState *ps, const char *path, int doe_dim) {
 
     /* Verify minimum viable host — can't attach to a headless corpse */
     if (!ps->host_tok_emb || !ps->host_output || !ps->host_norm) {
-        printf("[symbiont] host GGUF missing essential weights (tok=%p out=%p norm=%p). abandoning.\n",
+        printf("[doe] host GGUF missing essential weights (tok=%p out=%p norm=%p). abandoning.\n",
                (void*)ps->host_tok_emb, (void*)ps->host_output, (void*)ps->host_norm);
         munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; return 0;
     }
-    /* Skip MoE GGUFs that have expert-specific FFN layers (can't symbiont ourselves) */
+    /* Skip MoE GGUFs — can't index ourselves */
     int has_standard_ffn = 0;
     for (int l = 0; l < ps->host_n_layers && l < LORA_MAX_LAYERS; l++)
         if (ps->layers[l].ffn_gate && ps->layers[l].ffn_up && ps->layers[l].ffn_down) has_standard_ffn = 1;
     if (!has_standard_ffn) {
-        printf("[symbiont] host has no standard FFN layers (MoE?). symbiont needs a plain transformer.\n");
+        printf("[doe] host has no standard FFN layers (MoE?). needs a plain transformer.\n");
         munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; return 0;
     }
 
@@ -2614,22 +2613,21 @@ static int symbiont_load(SymbiontState *ps, const char *path, int doe_dim) {
     }
 
     ps->active = 1;
-    printf("[symbiont] attached to %s (dim=%d layers=%d heads=%d vocab=%d, %.1fMB)\n",
+    printf("[doe] indexed %s (dim=%d layers=%d heads=%d vocab=%d, %.1fMB)\n",
            path, ps->host_dim, ps->host_n_layers, ps->host_heads,
            ps->host_vocab, (float)ps->mmap_size / (1024*1024));
-    printf("[symbiont] LoRA rank=%d alpha=%.2f — the symbiont is feeding.\n", LORA_RANK, ps->lora_alpha);
+    printf("[doe] LoRA rank=%d alpha=%.2f\n", LORA_RANK, ps->lora_alpha);
     #undef PCHECK
     return 1;
 bail:
     if (ps->mmap_base) { munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; }
-    printf("[symbiont] GGUF parse failed. the symbiont loses its grip.\n");
+    printf("[doe] GGUF parse failed.\n");
     return 0;
 }
 
-/* Symbiont forward — run input through host model with DOE's LoRA injection.
- * the tree grows. the symbiont modulates. shared root system, independent growth.
+/* Host forward — run input through indexed model with DOE's LoRA injection.
  * returns logits over host vocabulary. */
-static void symbiont_forward(SymbiontState *ps, int token, int pos, float *out_logits,
+static void gguf_host_forward(GGUFHost *ps, int token, int pos, float *out_logits,
                               float *kv_cache_k, float *kv_cache_v, int max_seq) {
     int D = ps->host_dim, H = ps->host_heads, HD = ps->host_head_dim;
     int KVH = ps->host_kv_heads, HG = H / KVH;
@@ -2661,7 +2659,7 @@ static void symbiont_forward(SymbiontState *ps, int token, int pos, float *out_l
         for (int i = 0; i < kd; i++) { float s = 0; for (int j = 0; j < D; j++) s += ps->layers[l].wv[i*D+j] * xn[j]; v[i] = s; }
 
         /* RoPE on Q and K */
-        /* Inline RoPE — no precomputed cache in symbiont mode */
+        /* Inline RoPE — no precomputed cache in host mode */
         for (int h = 0; h < H; h++) {
             float *qh = q + h * HD; int half = HD / 2;
             for (int i = 0; i < half; i++) {
@@ -2687,7 +2685,7 @@ static void symbiont_forward(SymbiontState *ps, int token, int pos, float *out_l
         memcpy(kv_cache_k + kv_off_k, k, kd * 4);
         memcpy(kv_cache_v + kv_off_v, v, kd * 4);
 
-        /* Attention with DOE bias — the symbiont's grip */
+        /* Attention with DOE bias */
         float bias = 1.0f + ps->attention_bias[l];
         float sc = 1.0f / sqrtf((float)HD);
         float *attn_out = calloc(qd, 4);
@@ -2723,7 +2721,7 @@ static void symbiont_forward(SymbiontState *ps, int token, int pos, float *out_l
         for (int i = 0; i < D; i++) x[i] += ao[i];
         free(q); free(k); free(v); free(attn_out); free(ao);
 
-        /* FFN with LoRA injection — the symbiont feeds */
+        /* FFN with LoRA injection */
         float *fn = calloc(D, 4);
         ss = 0; for (int i = 0; i < D; i++) ss += x[i] * x[i];
         ss = 1.0f / sqrtf(ss / D + 1e-6f);
@@ -2769,7 +2767,7 @@ static void symbiont_forward(SymbiontState *ps, int token, int pos, float *out_l
     if (ps->host_norm) for (int i = 0; i < D; i++) x[i] = x[i] * ss * ps->host_norm[i];
     else for (int i = 0; i < D; i++) x[i] *= ss;
 
-    /* Logits — the host speaks, but the symbiont chose the words */
+    /* Logits */
     for (int i = 0; i < ps->host_vocab; i++) {
         float s = 0; for (int j = 0; j < D; j++) s += ps->host_output[i*D+j] * x[j];
         out_logits[i] = s;
@@ -2778,10 +2776,10 @@ static void symbiont_forward(SymbiontState *ps, int token, int pos, float *out_l
     free(x); free(tmp); free(lora_tmp);
 }
 
-/* NOTORCH LoRA training — Hebbian plasticity. the symbiont learns to steer.
+/* NOTORCH LoRA training — Hebbian plasticity.
  * signal = gradient of loss at layer output (positive = reinforce, negative = suppress)
  * A += lr * signal * x ⊗ u (outer product), B += lr * signal * u ⊗ dy */
-static void symbiont_notorch_step(SymbiontState *ps, int layer, float *input, float *grad_out,
+static void gguf_host_notorch(GGUFHost *ps, int layer, float *input, float *grad_out,
                                    float signal, float lr) {
     if (layer >= ps->host_n_layers || layer >= LORA_MAX_LAYERS) return;
     int D = ps->host_dim;
@@ -2819,7 +2817,7 @@ static void symbiont_notorch_step(SymbiontState *ps, int layer, float *input, fl
     if (ps->layer_focus[layer] < 0.5f) ps->layer_focus[layer] = 0.5f;
 }
 
-static void symbiont_free(SymbiontState *ps) {
+static void gguf_host_free(GGUFHost *ps) {
     if (ps->mmap_base) { munmap(ps->mmap_base, ps->mmap_size); ps->mmap_base = NULL; }
     for (int l = 0; l < LORA_MAX_LAYERS; l++) { free(ps->lora_A[l]); free(ps->lora_B[l]); ps->lora_A[l] = ps->lora_B[l] = NULL; }
     ps->active = 0;
@@ -3236,8 +3234,8 @@ int main(int argc, char **argv) {
     Environment env;
     env_scan(&env, __FILE__, c.dim);
 
-    /* ═══ SYMBIONT MODE — attach to nearby GGUF if compatible ═══ */
-    SymbiontState symbiont = {0};
+    /* ═══ HOST INDEX — attach to nearby GGUF if compatible ═══ */
+    GGUFHost ghost = {0};
     {
         int best_compat = -1; float best_score = 0;
         for (int i = 0; i < env.n_ggufs; i++) {
@@ -3250,12 +3248,12 @@ int main(int argc, char **argv) {
             }
         }
         if (best_compat >= 0 && best_score >= 0.5f) {
-            printf("[symbiont] best candidate: %s (compat=%.1f)\n", env.ggufs[best_compat].path, best_score);
-            if (!symbiont_load(&symbiont, env.ggufs[best_compat].path, c.dim)) {
-                printf("[symbiont] failed to attach. training standalone.\n");
+            printf("[doe] best host candidate: %s (compat=%.1f)\n", env.ggufs[best_compat].path, best_score);
+            if (!gguf_host_load(&ghost, env.ggufs[best_compat].path, c.dim)) {
+                printf("[doe] failed to index host. training standalone.\n");
             }
         } else {
-            printf("[symbiont] no compatible GGUF found. the symbiont swims alone.\n");
+            printf("[doe] no compatible GGUF found. training standalone.\n");
         }
     }
 
@@ -3462,9 +3460,9 @@ int main(int argc, char **argv) {
     printf("[env] cpu=%d mem=%.1fGB ggufs_found=%d compiler=%s curl=%s\n",
            env.cpu_count, (float)env.mem_available/(1024*1024*1024), env.n_ggufs,
            env.has_compiler?"yes":"no", env.has_curl?"yes":"no");
-    if (symbiont.active)
-        printf("[symbiont] attached to %s — dim=%d layers=%d. the symbiont fed well.\n",
-               symbiont.host_path, symbiont.host_dim, symbiont.host_n_layers);
+    if (ghost.active)
+        printf("[doe] indexed %s — dim=%d layers=%d\n",
+               ghost.host_path, ghost.host_dim, ghost.host_n_layers);
     if (tok_eye.code_mode)
         printf("[code] code detected: %.0f%% of input. DOE sees source.\n", tok_eye.code_ratio * 100);
 
@@ -3528,7 +3526,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < params.count; i++) free(grads[i]);
     free(grads);
     free(all_tok);
-    if (symbiont.active) symbiont_free(&symbiont);
+    if (ghost.active) gguf_host_free(&ghost);
     printf("[m] parliament adjourned.\n");
     return 0;
 }

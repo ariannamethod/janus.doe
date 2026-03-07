@@ -18,7 +18,7 @@ a transformer where experts are born, die, and hold elections:
 
 **parameters persist. topology doesn't.** each forward pass decides how many experts are alive, how many vote, how deep to go. same weights, different architecture every time.
 
-DoE scans its environment, attaches to nearby GGUFs via LoRA (symbiont mode), hunts for datasets on HuggingFace, recognizes code in training data, finds its own weights on restart, and can replicate itself via `fork()`.
+DoE scans its environment, indexes nearby GGUFs via LoRA, hunts for datasets on HuggingFace, recognizes code in training data, finds its own weights on restart, and can replicate itself via `fork()`.
 
 no pytorch. no python. no dignity.
 
@@ -93,7 +93,7 @@ dim = depth * 64 (cap 768). head_dim = 64. GQA above 384. hidden = 1.5x per expe
 1. **auto-sizes** to hardware (RAM, CPUs, GPU detection)
 2. **scans environment** — finds GGUFs, checks resources, detects compiler/curl
 3. **checks for own weights** — if m.gguf or mycelium spore found, skips training, goes to chat
-4. if compatible GGUF found — **symbiont mode** (LoRA + Meta-Arianna modulation)
+4. if compatible GGUF found — **host index mode** (LoRA + Meta-Arianna modulation)
 5. loads or generates data (HuggingFace API / Parquet / synthetic)
 6. trains BPE tokenizer that **knows its own compression ratio** and **detects code** (cached to `m_bpe.cache`)
 7. builds ephemeral MoE with living experts
@@ -183,9 +183,9 @@ DOE recognizes its own weights:
 4. loads all tensors including expert weights, revives dead experts
 5. skips training — straight to chat
 
-### symbiont mode (Delta Voice + Meta-Arianna)
+### host index mode (Delta Voice + Meta-Arianna)
 
-if DOE finds a compatible GGUF nearby, it attaches:
+if DOE finds a compatible GGUF nearby, it indexes it:
 
 ```
 host model (GGUF, mmap'd, read-only)
@@ -200,7 +200,7 @@ Delta Voice injection: out += alpha * A @ (B @ x)
 Hebbian training on LoRA only (no backward through host)
 ```
 
-the host model is a tree. DOE is the mycorrhiza. shared root system, independent growth.
+the host provides weights. DOE provides direction.
 
 ### code-aware tokenizer
 
