@@ -1,0 +1,67 @@
+
+  m.c — Democracy of Experts. parliament in session.
+
+[data] found m_data.txt (22.0 MB)
+[data] 23060483 bytes (22.0 MB)
+[bpe] training 2000 merges on 2097152 bytes...
+[bpe] 500/2000 merges (vocab=758)
+[bpe] 1000/2000 merges (vocab=1258)
+[bpe] 1500/2000 merges (vocab=1758)
+[bpe] 2000/2000 merges (vocab=2258)
+[bpe] done: 2000 merges, vocab=2258
+[tokenizer] 10929035 tokens (0.5 tok/byte) compression=2.11 health=0.53 code=1%
+[parser] quality=1.00 noise=0.000 domain_shift=0.000
+[model] depth=4 dim=256 heads=4 kv=4 hidden=384
+[model] initial_experts=4 max=16 params=6.94M
+[auto] max_steps=10000 (default 10K, use --steps to override)
+[load] restored 67 tensors from m.gguf — DOE remembers.
+[self] DOE found itself in m.gguf. skipping training.
+[env] cpu=30 mem=216.3GB disk=465.4GB compiler=yes curl=yes ggufs=1
+  [env] gguf: ./m.gguf arch=llama dim=256 layers=4 size=22.0MB compat=1.0
+[symbiont] best candidate: ./m.gguf (compat=1.0)
+[symbiont] host has no standard FFN layers (MoE?). symbiont needs a plain transformer.
+[symbiont] failed to attach. training standalone.
+[self] weights loaded. skipping training. straight to parliament.
+[personality] found personality.txt (491158 tokens), finetuning 2000 steps...
+[gpu] NVIDIA A100-SXM4-40GB — 42407 MB, compute 8.0, TF32 enabled
+  personality step 100/2000  loss=4.2356
+  personality step 200/2000  loss=3.3971
+  personality step 300/2000  loss=3.9549
+  personality step 400/2000  loss=4.2227
+  personality step 500/2000  loss=3.8595
+  personality step 600/2000  loss=3.8369
+  personality step 700/2000  loss=3.4822
+  personality step 800/2000  loss=3.7798
+  personality step 900/2000  loss=3.9003
+  personality step 1000/2000  loss=3.5086
+  personality step 1100/2000  loss=4.4035
+  personality step 1200/2000  loss=3.8914
+  personality step 1300/2000  loss=3.8892
+  personality step 1400/2000  loss=3.2964
+  personality step 1500/2000  loss=3.5287
+  personality step 1600/2000  loss=3.4612
+  personality step 1700/2000  loss=3.5461
+  personality step 1800/2000  loss=3.5574
+  personality step 1900/2000  loss=3.6899
+  personality step 2000/2000  loss=3.5524
+
+[m] the parliament is in session. type your message (Ctrl+C to adjourn):
+
+>   
+AA
+A: The par7. Sming is the harers the two ois (use in the harmantic that the right. The ration. CViency is a forms is the at where is contest " (Popin the next an aniers in S is a more than the parate of bopdelo — because in the manted agcurate " with the g can't s. The parsiment's is to be the next le the matters of on and can't 6 5.
+
+
+
+
+
+
+
+
+
+>   
+A: The next  you on code of m prep or is a p of your can not it unations. The low is the  right of ion in the ror of the distribution — the authority of " conver is notes. The parization is the mantt 1 it s " about the right of concept is factors is the inter. But most dies the on of the epistengines is the would be more than the clus code, and the authority of capt can concept about re
+
+>    as do is not the of the harm has a form. In the constance is the acopepistiory of the updy of the par-ent it is it is the state in a more should the attent of the monic " and the next to make. The ic to of the harm to be the pts outic of can it of the ude between re the right and the right't is a re's is the right pum bate in the harmoral where but now; when the would 
+
+> 
