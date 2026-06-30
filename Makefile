@@ -24,9 +24,12 @@ blas: janusdoe.c
 openblas: janusdoe.c
 	$(CC) $(CFLAGS) -DUSE_BLAS $< $(LDFLAGS) -lopenblas -o m
 
-# cuBLAS TF32 (NVIDIA A100/H100, ~25x)
+# cuBLAS TF32 (NVIDIA A100/H100/A40, ~25x)
+# CUDA toolkit headers/libs live under $(CUDA_HOME) on devel images
+# (canonical symlink /usr/local/cuda). Override: make cuda CUDA_HOME=/path.
+CUDA_HOME ?= /usr/local/cuda
 cuda: janusdoe.c
-	$(CC) $(CFLAGS) -DUSE_CUBLAS $< $(LDFLAGS) -lcublas -lcudart -o m
+	$(CC) $(CFLAGS) -DUSE_CUBLAS $< $(LDFLAGS) -I$(CUDA_HOME)/include -L$(CUDA_HOME)/lib64 -lcublas -lcudart -o m
 
 # ─── test ─────────────────────────────────────────────────────────────
 # smoke tests — the parliament demands accountability

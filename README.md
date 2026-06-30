@@ -65,7 +65,7 @@ make cuda        # NVIDIA cuBLAS TF32 (A100/H100, ~25x)
 make test        # smoke tests
 
 # or by hand:
-cc janusdoe.c -O3 -lm -lpthread -DUSE_CUBLAS -lcublas -lcudart -o m                   # cuBLAS
+cc janusdoe.c -O3 -lm -lpthread -DUSE_CUBLAS -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lcublas -lcudart -o m   # cuBLAS
 cc janusdoe.c -O3 -lm -lpthread -DUSE_BLAS -DACCELERATE -framework Accelerate -o m    # macOS
 cc janusdoe.c -O3 -lm -lpthread -DUSE_BLAS -lopenblas -o m                            # linux
 ```
