@@ -2770,13 +2770,14 @@ typedef struct {
     char  host_arch[64];    /* general.architecture from GGUF — gates RoPE pairing (NORM vs NEOX) */
     struct {
         float *wq, *wk, *wv, *wo;
+        float *wq_b, *wk_b, *wv_b;   /* qwen2/qwen2.5 attention QKV biases (llama/mistral have none → NULL) */
         float *ffn_gate, *ffn_up, *ffn_down;
         float *attn_norm, *ffn_norm;
         /* packed GGUF dtype per matvec weight (0 = f32; else kept packed, dequant inline) */
         int wq_dt, wk_dt, wv_dt, wo_dt, ffn_gate_dt, ffn_up_dt, ffn_down_dt;
     } layers[LORA_MAX_LAYERS];
-    /* malloc'd f32 buffers from one-time dequant (tok_emb / norms) — freed on teardown */
-    float *dq_bufs[LORA_MAX_LAYERS*3];
+    /* malloc'd f32 buffers from one-time dequant (tok_emb / norms / qkv biases) — freed on teardown */
+    float *dq_bufs[LORA_MAX_LAYERS*8];
     int    n_dq_bufs;
 
     /* DOE's LoRA overlays — a parliament of experts per layer, ≥1 alive. Delta Voice:
@@ -2971,6 +2972,11 @@ static int gguf_host_load(GGUFHost *ps, const char *path, int doe_dim) {
                 if (strstr(n, "attn_q.weight")) ps->layers[l].wq = jd_host_resolve(ps, raw, pend, dt, ne, c, 0, &ps->layers[l].wq_dt);
                 else if (strstr(n, "attn_k.weight")) ps->layers[l].wk = jd_host_resolve(ps, raw, pend, dt, ne, c, 0, &ps->layers[l].wk_dt);
                 else if (strstr(n, "attn_v.weight")) ps->layers[l].wv = jd_host_resolve(ps, raw, pend, dt, ne, c, 0, &ps->layers[l].wv_dt);
+                /* QKV biases: accept only if length matches exactly (q=H*HD, k/v=KVH*HD) — a
+                 * malformed/truncated GGUF with a short bias would otherwise OOB the +=loop in forward. */
+                else if (strstr(n, "attn_q.bias")) { if (ne == (uint64_t)ps->host_heads * ps->host_head_dim) ps->layers[l].wq_b = jd_host_resolve(ps, raw, pend, dt, ne, c, 1, &wdt); }
+                else if (strstr(n, "attn_k.bias")) { if (ne == (uint64_t)ps->host_kv_heads * ps->host_head_dim) ps->layers[l].wk_b = jd_host_resolve(ps, raw, pend, dt, ne, c, 1, &wdt); }
+                else if (strstr(n, "attn_v.bias")) { if (ne == (uint64_t)ps->host_kv_heads * ps->host_head_dim) ps->layers[l].wv_b = jd_host_resolve(ps, raw, pend, dt, ne, c, 1, &wdt); }
                 else if (strstr(n, "attn_output.weight")) ps->layers[l].wo = jd_host_resolve(ps, raw, pend, dt, ne, c, 0, &ps->layers[l].wo_dt);
                 else if (strstr(n, "ffn_gate.weight") && !strstr(n, "ffn_gate_inp")) ps->layers[l].ffn_gate = jd_host_resolve(ps, raw, pend, dt, ne, c, 0, &ps->layers[l].ffn_gate_dt);
                 else if (strstr(n, "ffn_up.weight")) ps->layers[l].ffn_up = jd_host_resolve(ps, raw, pend, dt, ne, c, 0, &ps->layers[l].ffn_up_dt);
@@ -3191,6 +3197,10 @@ static void gguf_host_forward(GGUFHost *ps, int token, int pos, float *out_logit
         jd_mv(q, ps->layers[l].wq, ps->layers[l].wq_dt, xn, qd, D);
         jd_mv(k, ps->layers[l].wk, ps->layers[l].wk_dt, xn, kd, D);
         jd_mv(v, ps->layers[l].wv, ps->layers[l].wv_dt, xn, kd, D);
+        /* Qwen2 attention QKV biases (post-projection; llama/mistral lack them → NULL skip) */
+        if (ps->layers[l].wq_b) for (int i = 0; i < qd; i++) q[i] += ps->layers[l].wq_b[i];
+        if (ps->layers[l].wk_b) for (int i = 0; i < kd; i++) k[i] += ps->layers[l].wk_b[i];
+        if (ps->layers[l].wv_b) for (int i = 0; i < kd; i++) v[i] += ps->layers[l].wv_b[i];
 
         /* RoPE on Q and K — arch-gated pairing (NORM=adjacent 2i,2i+1 for llama/mistral;
          * NEOX=offset-half i,i+hd/2 for qwen/gemma/...). Wrong mode corrupts rope at pos>0.
