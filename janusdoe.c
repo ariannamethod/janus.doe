@@ -473,6 +473,8 @@ static void parser_eye_update(ParserEye *eye, int *tokens, int n_tokens, const c
  * ═══════════════════════════════════════════════════════════════════════════════ */
 typedef struct {
     float *data; int size, rows, cols;
+    uint8_t *packed; int dtype;  /* non-NULL => weight kept quantized (Q8_0…) for inference; matvec_t dequants inline (no f32 blow-up, doe-style) */
+    int no_quant;  /* 1 => never Q8-export (accessed via ->data directly, not matvec_t: token_embd row-lookup, w_vote election) */
 #ifdef USE_CUBLAS
     float *d_data;  /* GPU-resident copy — upload once, reuse */
     int    gpu_dirty; /* 1 = CPU changed, needs re-upload */
@@ -485,7 +487,7 @@ static void tfree(Tensor*t){if(t){
 #ifdef USE_CUBLAS
     if(t->d_data)cudaFree(t->d_data);
 #endif
-    free(t->data);free(t);}}
+    free(t->packed);free(t->data);free(t);}}
 /* Mark tensor as dirty — GPU copy needs re-upload after adam step */
 static void tmark_dirty(Tensor*t){
 #ifdef USE_CUBLAS
@@ -517,8 +519,10 @@ static void matvec(float*out,float*W,float*x,int r,int co){
     for(int i=0;i<r;i++){float s=0;float*row=W+i*co;for(int j=0;j<co;j++)s+=row[j]*x[j];out[i]=s;}
 #endif
 }
+static void jd_mv(float*,const float*,int,const float*,int,int);  /* fwd-decl: packed inline-dequant matvec, defined below */
 /* matvec with GPU weight cache — W stays on GPU between calls */
 static void matvec_t(float*out,Tensor*W,float*x,int r,int co){
+    if (W->packed) { jd_mv(out,(const float*)W->packed,W->dtype,x,r,co); return; }  /* quantized weight: inline dequant, no f32 blow-up */
 #ifdef USE_CUBLAS
     cublas_init();
     float *dW=gpu_ensure(W->data, W->size, &W->d_data, &W->gpu_dirty);
@@ -744,7 +748,7 @@ static void free_expert(Expert *e) {
 static void init_weights(ModelW *w, Config *c) {
     float es = 1.0f / sqrtf((float)c->dim), ls = 1.0f / sqrtf((float)c->dim);
     int qd = c->n_heads * c->head_dim, kd = c->n_kv_heads * c->head_dim;
-    w->tok_emb = tnew2d(c->vocab_size, c->dim); tinit(w->tok_emb, es);
+    w->tok_emb = tnew2d(c->vocab_size, c->dim); tinit(w->tok_emb, es); w->tok_emb->no_quant = 1; /* row-lookup, not matvec */
     w->output = tnew2d(c->vocab_size, c->dim); tinit(w->output, ls);
     w->output_norm = tnew(c->dim); for (int i = 0; i < c->dim; i++) w->output_norm->data[i] = 1.0f;
     w->n_layers = c->depth;
@@ -758,7 +762,7 @@ static void init_weights(ModelW *w, Config *c) {
         lw->wv = tnew2d(kd, c->dim); tinit(lw->wv, ls);
         lw->wo = tnew2d(c->dim, qd); memset(lw->wo->data, 0, lw->wo->size * sizeof(float));
         /* Parliament */
-        lw->parliament.w_vote = tnew2d(MAX_EXPERTS, c->dim); tinit(lw->parliament.w_vote, 0.01f);
+        lw->parliament.w_vote = tnew2d(MAX_EXPERTS, c->dim); tinit(lw->parliament.w_vote, 0.01f); lw->parliament.w_vote->no_quant = 1; /* election reads ->data directly */
         lw->parliament.consensus = 0.5f;
         lw->parliament.election_count = 0;
         memset(lw->parliament.faction_power, 0, sizeof(lw->parliament.faction_power));
@@ -1776,7 +1780,43 @@ static void wstr(FILE*f,const char*s){uint64_t l=strlen(s);w64(f,l);fwrite(s,1,l
 static void wkv_s(FILE*f,const char*k,const char*v){wstr(f,k);w32(f,8);wstr(f,v);}
 static void wkv_u(FILE*f,const char*k,uint32_t v){wstr(f,k);w32(f,4);w32(f,v);}
 static void wkv_f(FILE*f,const char*k,float v){wstr(f,k);w32(f,6);fwrite(&v,4,1,f);}
-static void wti(FILE*f,const char*name,Tensor*t,uint64_t*off){wstr(f,name);if(t->rows>1){w32(f,2);w64(f,t->cols);w64(f,t->rows);}else{w32(f,1);w64(f,t->size);}w32(f,0);w64(f,*off);*off+=t->size*4;}
+/* ── Q8_0 self-quant encoder (inverse of jd_dequant_q8_0) — keeps the exported GGUF
+ * compact instead of blowing up to f32 on disk, doe-style. Block = f16 scale + 32 int8. ── */
+static uint16_t jd_f32_to_f16(float f){
+    uint32_t x; memcpy(&x,&f,4);
+    uint32_t sign=(x>>16)&0x8000; int32_t exp=(int32_t)((x>>23)&0xff)-127+15; uint32_t man=x&0x7fffff;
+    if(exp<=0){ if(exp<-10) return (uint16_t)sign; man|=0x800000; uint32_t shift=(uint32_t)(14-exp);
+        uint32_t h=man>>shift; if((man>>(shift-1))&1) h++; return (uint16_t)(sign|h); }
+    if(exp>=31){ return (uint16_t)(sign|0x7c00); }   /* overflow -> inf */
+    uint16_t h=(uint16_t)(sign|((uint32_t)exp<<10)|(man>>13)); if((man>>12)&1) h++; return h;
+}
+/* Q8_0: per-32 block, scale = amax/127 (f16) + 32 int8 = 34 bytes. Requires n % 32 == 0. */
+static void jd_quant_q8_0_enc(const float *src, uint8_t *dst, uint64_t n){
+    uint64_t nb=n/32;
+    for(uint64_t b=0;b<nb;b++){
+        const float *xb=src+b*32; float amax=0;
+        for(int i=0;i<32;i++){ float v=fabsf(xb[i]); if(v>amax)amax=v; }
+        float d=amax/127.0f, id=(d>0)?1.0f/d:0.0f;
+        uint8_t *o=dst+b*34; uint16_t dh=jd_f32_to_f16(d); o[0]=(uint8_t)(dh&0xff); o[1]=(uint8_t)(dh>>8);
+        for(int i=0;i<32;i++){ int q=(int)lrintf(xb[i]*id); if(q>127)q=127; else if(q<-127)q=-127; o[2+i]=(uint8_t)(int8_t)q; }
+    }
+}
+/* --save-q8: export 2D matvec weights (row length ÷32) as Q8_0; embeddings/norms stay f32.
+ * g_want_q8 is the CLI intent; g_export_q8 is armed only for the FINAL export so mycelium
+ * spores (training checkpoints) stay lossless f32. */
+static int g_export_q8 = 0;
+static int g_want_q8 = 0;
+static int g_loaded_packed = 0;   /* set when load_own_gguf packs any tensor (Q8) → model is inference-only (its ->data is freed; training paths must not touch it) */
+static int t_is_q8(const Tensor*t){ return g_export_q8 && !t->no_quant && t->rows>1 && (t->cols%32)==0; }
+
+static void wti(FILE*f,const char*name,Tensor*t,uint64_t*off){
+    wstr(f,name);
+    if(t->rows>1){w32(f,2);w64(f,t->cols);w64(f,t->rows);}else{w32(f,1);w64(f,t->size);}
+    /* already-packed (loaded Q8, data freed) OR fresh --save-q8 → write Q8_0; else f32.
+     * packed is only ever Q8_0 (dtype 8), size%32==0, so (size/32)*34 is exact. */
+    if(t->packed || t_is_q8(t)){ w32(f,8); w64(f,*off); *off+=(uint64_t)(t->size/32)*34; }
+    else { w32(f,0); w64(f,*off); *off+=(uint64_t)t->size*4; }
+}
 
 static void export_gguf(ModelW *w, Config *c) {
     FILE *f = fopen(c->gguf_path, "wb"); if (!f) { printf("[gguf] failed\n"); return; }
@@ -1814,7 +1854,10 @@ static void export_gguf(ModelW *w, Config *c) {
         }
     }
     long p = ftell(f); long al = ((p+31)/32)*32; for (long i = p; i < al; i++) fputc(0, f);
-    #define WD(t) fwrite((t)->data, 4, (t)->size, f)
+    #define WD(t) do { \
+        if((t)->packed){ fwrite((t)->packed, 1, (size_t)((t)->size/32)*34, f); } \
+        else if(t_is_q8(t)){ uint64_t _nb=(uint64_t)(t)->size/32; uint8_t*_q=malloc(_nb*34); if(_q){ jd_quant_q8_0_enc((t)->data,_q,(t)->size); fwrite(_q,1,_nb*34,f); free(_q); } } \
+        else fwrite((t)->data, 4, (t)->size, f); } while(0)
     WD(w->tok_emb); WD(w->output_norm); WD(w->output);
     for (int l = 0; l < c->depth; l++) {
         LayerW *lw = &w->layers[l]; WD(lw->attn_norm); WD(lw->wq); WD(lw->wk); WD(lw->wv); WD(lw->wo); WD(lw->ffn_norm); WD(lw->parliament.w_vote);
@@ -1829,6 +1872,7 @@ static void export_gguf(ModelW *w, Config *c) {
  * GGUF LOADER — reverse of export. DOE finds its own weights and remembers.
  * no --load flag needed. the organism recognizes itself.
  * ═══════════════════════════════════════════════════════════════════════════════ */
+static uint64_t jd_quant_bytes(uint32_t dt, uint64_t n);   /* fwd-decl: packed byte size, defined with the dequant kernels */
 static int load_own_gguf(const char *path, ModelW *w, Config *c) {
     FILE *f = fopen(path, "rb"); if (!f) return 0;
     /* Read header */
@@ -1860,7 +1904,7 @@ static int load_own_gguf(const char *path, ModelW *w, Config *c) {
                           path, found_depth, found_dim, c->depth, c->dim); return 0;
     }
     /* Parse tensor info — just get names and offsets */
-    typedef struct { char name[96]; uint32_t ndim; uint64_t shape[4]; uint64_t offset; uint64_t nbytes; } TI;
+    typedef struct { char name[96]; uint32_t ndim; uint64_t shape[4]; uint64_t offset; uint64_t nbytes; uint64_t nelem; uint32_t dtype; } TI;
     TI *tinfo = calloc(n_tensors, sizeof(TI));
     if (!tinfo) { fclose(f); return 0; }
     for (uint64_t i = 0; i < n_tensors; i++) {
@@ -1868,11 +1912,22 @@ static int load_own_gguf(const char *path, ModelW *w, Config *c) {
         if (nl > 95) { free(tinfo); fclose(f); return 0; }
         fread(tinfo[i].name, 1, nl, f); tinfo[i].name[nl] = '\0';
         fread(&tinfo[i].ndim, 4, 1, f);
+        if (tinfo[i].ndim > 4) { free(tinfo); fclose(f); return 0; }   /* GGUF: ≤4 dims; guard shape[4] write (OOB on crafted ndim) */
         uint64_t sz = 1;
         for (uint32_t d = 0; d < tinfo[i].ndim; d++) { fread(&tinfo[i].shape[d], 8, 1, f); sz *= tinfo[i].shape[d]; }
-        uint32_t dtype; fread(&dtype, 4, 1, f); /* 0 = f32 */
+        uint32_t dtype; fread(&dtype, 4, 1, f); /* 0 = f32, 8 = Q8_0 (self-quant) */
         fread(&tinfo[i].offset, 8, 1, f);
-        tinfo[i].nbytes = sz * 4;
+        /* our own exports are only f32 or Q8_0; reject anything else so re-export (which
+         * writes packed as Q8_0) and jd_mv never meet an unsupported packed dtype. */
+        if (dtype != 0 && dtype != 8) { free(tinfo); fclose(f); return 0; }
+        if (dtype == 8 && (sz % 32) != 0) { free(tinfo); fclose(f); return 0; }   /* Q8_0 block = 32 elems */
+        /* direct-read tensors must be f32 — a crafted Q8 here would pack them, free ->data,
+         * and NULL-deref in forward: every 1D norm (rmsnorm reads ->data), token_embd
+         * (row-lookup), and ffn_gate_inp/w_vote (election reads ->data). Only 2D matvec
+         * weights (attn q/k/v/o, output, expert ffn) may be Q8. */
+        if ((tinfo[i].ndim == 1 || strstr(tinfo[i].name, "norm.weight") || strcmp(tinfo[i].name, "token_embd.weight") == 0 || strstr(tinfo[i].name, "ffn_gate_inp.weight")) && dtype != 0) { free(tinfo); fclose(f); return 0; }
+        tinfo[i].nelem = sz; tinfo[i].dtype = dtype;
+        tinfo[i].nbytes = jd_quant_bytes(dtype, sz);   /* dtype ∈ {0,8} guaranteed above */
     }
     /* Align to 32 bytes */
     long hdr_end = ftell(f);
@@ -1895,20 +1950,35 @@ static int load_own_gguf(const char *path, ModelW *w, Config *c) {
     if (!have_emb) { free(tinfo); fclose(f); return 0; }
     /* Load tensors by name */
     int loaded = 0;   /* the atomic guard above already proved every tensor fits, so reads can't short-read */
+    /* f32 tensor → read into ->data; quantized (Q8_0…) → keep bytes PACKED in ->packed and
+     * free the f32 ->data buffer, so a quantized self-model does NOT blow up to f32 in RAM
+     * (matvec_t dequants inline). Match by element count so f32 and packed both resolve. */
     #define LOAD_T(tensor, tname) do { \
         for (uint64_t _i = 0; _i < n_tensors; _i++) { \
-            if (strcmp(tinfo[_i].name, tname) == 0 && (tensor) && (tensor)->size * 4 == (int)tinfo[_i].nbytes) { \
+            if (strcmp(tinfo[_i].name, tname) == 0 && (tensor) && tinfo[_i].nelem == (uint64_t)(tensor)->size) { \
                 fseek(f, data_start + tinfo[_i].offset, SEEK_SET); \
-                if (fread((tensor)->data, 4, (tensor)->size, f) == (size_t)(tensor)->size) loaded++; break; \
+                if (tinfo[_i].dtype == 0) { if (fread((tensor)->data, 4, (tensor)->size, f) == (size_t)(tensor)->size) loaded++; } \
+                else { uint8_t *_pk = malloc(tinfo[_i].nbytes); \
+                    if (_pk && fread(_pk, 1, tinfo[_i].nbytes, f) == tinfo[_i].nbytes) { \
+                        free((tensor)->packed); (tensor)->packed = _pk; (tensor)->dtype = (int)tinfo[_i].dtype; \
+                        free((tensor)->data); (tensor)->data = NULL; g_loaded_packed = 1; loaded++; } \
+                    else free(_pk); } \
+                break; \
             } \
         } \
     } while(0)
     /* returning variant: 1 only on a FULL read — used to reject truncated/partial experts */
     #define LOAD_TR(tensor, tname) ({ int _ok = 0; \
         for (uint64_t _i = 0; _i < n_tensors; _i++) { \
-            if (strcmp(tinfo[_i].name, tname) == 0 && (tensor) && (tensor)->size * 4 == (int)tinfo[_i].nbytes) { \
+            if (strcmp(tinfo[_i].name, tname) == 0 && (tensor) && tinfo[_i].nelem == (uint64_t)(tensor)->size) { \
                 fseek(f, data_start + tinfo[_i].offset, SEEK_SET); \
-                if (fread((tensor)->data, 4, (tensor)->size, f) == (size_t)(tensor)->size) { loaded++; _ok = 1; } break; \
+                if (tinfo[_i].dtype == 0) { if (fread((tensor)->data, 4, (tensor)->size, f) == (size_t)(tensor)->size) { loaded++; _ok = 1; } } \
+                else { uint8_t *_pk = malloc(tinfo[_i].nbytes); \
+                    if (_pk && fread(_pk, 1, tinfo[_i].nbytes, f) == tinfo[_i].nbytes) { \
+                        free((tensor)->packed); (tensor)->packed = _pk; (tensor)->dtype = (int)tinfo[_i].dtype; \
+                        free((tensor)->data); (tensor)->data = NULL; g_loaded_packed = 1; loaded++; _ok = 1; } \
+                    else free(_pk); } \
+                break; \
             } \
         } _ok; })
     int tok_ok = LOAD_TR(w->tok_emb, "token_embd.weight");
@@ -3620,6 +3690,7 @@ static int hunt_dataset(Config *c, Tokenizer *tok, TokenizerEye *tok_eye, Parser
 /* SELF-REPLICATION — on sustained population overload, DOE compiles a copy of its own
  * source and forks a replica that trains on different data; results merge via mycelium. */
 static pid_t self_replicate(Environment *env, Config *c, int replica_depth) {
+    if (getenv("JD_NO_REPLICATE")) { printf("[replicate] disabled (JD_NO_REPLICATE) — no fork.\n"); return 0; }   /* hard off-switch: never fork replicas on shared/metered hosts */
     if (!env->has_compiler) { printf("[replicate] no compiler found. stuck in this body.\n"); return 0; }
     if (env->self_path[0] == '\0') { printf("[replicate] don't know where my source is.\n"); return 0; }
     struct stat st; if (stat(env->self_path, &st) != 0) { printf("[replicate] source %s not present.\n", env->self_path); return 0; }
@@ -3840,6 +3911,7 @@ int main(int argc, char **argv) {
             printf("  --parquet FILE  extract text from .parquet file\n");
             printf("  --steps N       override max training steps (default: auto from data)\n");
             printf("  --bpe-merges N  override BPE merge count (default: auto from depth)\n");
+            printf("  --save-q8      export the final m.gguf as Q8_0 (compact; loads packed, no f32 blow-up)\n");
             printf("  --personality   path to personality.txt for finetuning\n");
             printf("  --pages N       HuggingFace pages to download (auto-sized to depth)\n");
             printf("  --host GGUF     index a model and generate through it (LoRA parliament)\n");
@@ -3906,6 +3978,7 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--steps") == 0 && i+1 < argc) { c.max_steps = atoi(argv[++i]); c.explicit_steps = 1; }
         else if (strcmp(argv[i], "--bpe-merges") == 0 && i+1 < argc) c.bpe_merges = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--save-q8") == 0) g_want_q8 = 1;
         else if (strcmp(argv[i], "--personality") == 0 && i+1 < argc) snprintf(c.personality_path, 256, "%s", argv[++i]);
         else if (strcmp(argv[i], "--pages") == 0 && i+1 < argc) c.hf_pages = atoi(argv[++i]);
     }
@@ -4007,6 +4080,7 @@ int main(int argc, char **argv) {
                 printf("[self] DOE found itself in %s. skipping training.\n", candidates[i]);
                 break;
             }
+            if (g_loaded_packed) break;   /* a partial packed load already freed some ->data — don't retry another candidate into freed buffers */
         }
     }
 
@@ -4062,8 +4136,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (weights_loaded) {
-        printf("[self] weights loaded. skipping training. straight to parliament.\n");
+    if (weights_loaded || g_loaded_packed) {
+        printf("[self] weights loaded%s. skipping training. straight to parliament.\n",
+               g_loaded_packed ? " (packed Q8 — inference-only)" : "");
         goto skip_training;
     }
     printf("[train] %d steps, seq=%d, lr=%.1e\n", c.max_steps, c.seq_len, c.lr);
@@ -4296,10 +4371,13 @@ int main(int argc, char **argv) {
         printf("[code] code detected: %.0f%% of input. DOE sees source.\n", tok_eye.code_ratio * 100);
 
     skip_training:
-    /* Personality finetune — runs even if weights loaded from GGUF */
+    /* Personality finetune — runs even if weights loaded from GGUF, but NOT on a packed
+     * (Q8-loaded) model: its ->data is freed, and finetune uses the f32 training path. */
     {
         struct stat pst;
-        if (stat(c.personality_path, &pst) == 0 && pst.st_size > 10) {
+        if (g_loaded_packed && c.personality_path[0])
+            printf("[personality] skipped — model loaded packed (Q8, inference-only)\n");
+        if (!g_loaded_packed && stat(c.personality_path, &pst) == 0 && pst.st_size > 10) {
             int pl; char *ptxt = load_text(c.personality_path, &pl);
             if (ptxt && pl > 10) {
                 int pnt; int *ptok; int *pmask;
@@ -4357,6 +4435,7 @@ int main(int argc, char **argv) {
             free(ptxt);
         } else if (c.personality_path[0]) printf("[personality] no %s found, skipping\n", c.personality_path);
     }
+    g_export_q8 = g_want_q8;   /* arm Q8_0 only for the final artifact — mycelium spores stayed f32 */
     export_gguf(&w, &c); /* always save — training or personality may have updated weights */
     if (ghost.active) {
         printf("\n[doe] auto-indexed host %s — the parliament speaks through it:\n  ", ghost.host_path);
