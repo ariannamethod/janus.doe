@@ -83,6 +83,7 @@ cc janusdoe.c -O3 -lm -lpthread -DUSE_BLAS -lopenblas -o m                      
 | `--steps N` | auto | override max training steps |
 | `--bpe-merges N` | auto | override BPE merge count |
 | `--host GGUF` | — | index a host model, generate through its LoRA parliament |
+| `--coder KEY` | — | fetch + keep a resident Qwen2.5-Coder GGUF (`1.5b`/`3b`/`7b`), pinned-sha256 verified, run via host |
 | `--ask "PROMPT"` | sample | prompt for `--host` generation |
 | `--learn FILE` | — | Hebbian-train the parliament on text (no backward through host) |
 | `--rope-neox` | auto | force NeoX RoPE pairing (arch=llama GGUFs laid out NeoX) |

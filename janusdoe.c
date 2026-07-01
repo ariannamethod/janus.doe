@@ -3644,6 +3644,89 @@ static pid_t self_replicate(Environment *env, Config *c, int replica_depth) {
     return pid;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * RESIDENT CODER — DOE fetches its own coder brain (a small Qwen2.5-Coder GGUF) and
+ * keeps it at hand under weights/coder/. Ported from nanoagi: a pinned whitelist with
+ * a MANDATORY sha256, streamed straight from HuggingFace (no token, no API), verified
+ * against a pinned size + hash, atomically installed. A mismatch is a hard failure — a
+ * corrupt or malicious same-size file is never kept. The organism then runs the coder
+ * in-process through the host path (θ=ε+γ+αδ, Qwen2-correct) to write code.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* ── SHA-256 (FIPS 180-4), self-contained — for pinned coder-GGUF verification ── */
+typedef struct { uint32_t s[8]; uint64_t nbits; uint8_t buf[64]; uint32_t blen; } JD_SHA256;
+static const uint32_t JD_SHA_K[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+#define JD_ROR(x,n) (((x)>>(n))|((x)<<(32-(n))))
+static void jd_sha256_init(JD_SHA256 *c){ c->s[0]=0x6a09e667;c->s[1]=0xbb67ae85;c->s[2]=0x3c6ef372;c->s[3]=0xa54ff53a;c->s[4]=0x510e527f;c->s[5]=0x9b05688c;c->s[6]=0x1f83d9ab;c->s[7]=0x5be0cd19;c->nbits=0;c->blen=0; }
+static void jd_sha256_block(JD_SHA256 *c, const uint8_t *p){
+    uint32_t w[64];
+    for(int i=0;i<16;i++) w[i]=((uint32_t)p[i*4]<<24)|((uint32_t)p[i*4+1]<<16)|((uint32_t)p[i*4+2]<<8)|((uint32_t)p[i*4+3]);
+    for(int i=16;i<64;i++){ uint32_t s0=JD_ROR(w[i-15],7)^JD_ROR(w[i-15],18)^(w[i-15]>>3); uint32_t s1=JD_ROR(w[i-2],17)^JD_ROR(w[i-2],19)^(w[i-2]>>10); w[i]=w[i-16]+s0+w[i-7]+s1; }
+    uint32_t a=c->s[0],b=c->s[1],cc=c->s[2],d=c->s[3],e=c->s[4],f=c->s[5],g=c->s[6],h=c->s[7];
+    for(int i=0;i<64;i++){ uint32_t S1=JD_ROR(e,6)^JD_ROR(e,11)^JD_ROR(e,25); uint32_t ch=(e&f)^((~e)&g); uint32_t t1=h+S1+ch+JD_SHA_K[i]+w[i]; uint32_t S0=JD_ROR(a,2)^JD_ROR(a,13)^JD_ROR(a,22); uint32_t mj=(a&b)^(a&cc)^(b&cc); uint32_t t2=S0+mj; h=g;g=f;f=e;e=d+t1;d=cc;cc=b;b=a;a=t1+t2; }
+    c->s[0]+=a;c->s[1]+=b;c->s[2]+=cc;c->s[3]+=d;c->s[4]+=e;c->s[5]+=f;c->s[6]+=g;c->s[7]+=h;
+}
+static void jd_sha256_update(JD_SHA256 *c, const uint8_t *p, size_t n){
+    c->nbits += (uint64_t)n*8;
+    while(n){ uint32_t k=64-c->blen; if((size_t)k>n)k=(uint32_t)n; memcpy(c->buf+c->blen,p,k); c->blen+=k; p+=k; n-=k; if(c->blen==64){ jd_sha256_block(c,c->buf); c->blen=0; } }
+}
+static void jd_sha256_final(JD_SHA256 *c, uint8_t out[32]){
+    uint64_t nb=c->nbits; uint8_t pad=0x80; jd_sha256_update(c,&pad,1);
+    uint8_t z=0; while(c->blen!=56) jd_sha256_update(c,&z,1);
+    uint8_t len[8]; for(int i=0;i<8;i++) len[i]=(uint8_t)(nb>>(56-i*8)); jd_sha256_update(c,len,8);
+    for(int i=0;i<8;i++){ out[i*4]=(uint8_t)(c->s[i]>>24);out[i*4+1]=(uint8_t)(c->s[i]>>16);out[i*4+2]=(uint8_t)(c->s[i]>>8);out[i*4+3]=(uint8_t)c->s[i]; }
+}
+static int jd_sha256_file(const char *path, char hex[65]){
+    FILE *f=fopen(path,"rb"); if(!f) return 1;
+    JD_SHA256 c; jd_sha256_init(&c); uint8_t *b=malloc(1<<20); if(!b){ fclose(f); return 1; }
+    size_t r; while((r=fread(b,1,1<<20,f))>0) jd_sha256_update(&c,b,r);
+    free(b); fclose(f); uint8_t d[32]; jd_sha256_final(&c,d);
+    for(int i=0;i<32;i++) snprintf(hex+i*2,3,"%02x",(unsigned)d[i]); hex[64]='\0'; return 0;
+}
+
+/* ── coder whitelist: (key, repo, file, pinned size, pinned sha256) — from nanoagi ── */
+typedef struct { const char *key,*repo,*file; long long size; const char *sha; } CoderGGUF;
+static const CoderGGUF CODER_WHITELIST[] = {
+    {"1.5b","Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF","qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",1117320768LL,"cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046"},
+    {"3b",  "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF",  "qwen2.5-coder-3b-instruct-q4_k_m.gguf",  2104932800LL,"724fb256bec1ff062b2f65e4569e871ad2e95ab2a3989723d1769c54294730b7"},
+    {"7b",  "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",  "qwen2.5-coder-7b-instruct-q4_k_m.gguf",  4683073536LL,"509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c"},
+};
+
+/* fetch_coder_gguf — make the keyed coder GGUF resident in weights/coder/, verified.
+ * Trusts an existing file only if BOTH size and pinned sha256 match. Streams to a .part,
+ * checks size + sha256, then atomically renames. Any failure discards. 0 on success. */
+static int fetch_coder_gguf(const char *key, char *out_path, int out_sz){
+    const CoderGGUF *e=NULL;
+    for(size_t i=0;i<sizeof(CODER_WHITELIST)/sizeof(CODER_WHITELIST[0]);i++)
+        if(strcmp(CODER_WHITELIST[i].key,key)==0){ e=&CODER_WHITELIST[i]; break; }
+    if(!e){ printf("[coder] key '%s' not whitelisted (1.5b|3b|7b)\n",key); return 1; }
+    if(system("mkdir -p weights/coder 2>/dev/null")!=0){ printf("[coder] cannot create weights/coder\n"); return 1; }
+    char dest[512],part[560],hex[65]; struct stat st;
+    snprintf(dest,sizeof(dest),"weights/coder/%s",e->file);
+    snprintf(part,sizeof(part),"%s.part",dest);
+    if(stat(dest,&st)==0 && (long long)st.st_size==e->size && jd_sha256_file(dest,hex)==0 && strcmp(hex,e->sha)==0){
+        printf("[coder] resident (verified): %s\n",dest); snprintf(out_path,out_sz,"%s",dest); return 0; }
+    remove(part);
+    /* repo/file come ONLY from the hardcoded whitelist above — never user input → no shell injection. */
+    char cmd[1024];
+    snprintf(cmd,sizeof(cmd),"curl -fsSL --retry 3 -A 'janus.DoE/1.0 (self-code)' -o '%s' 'https://huggingface.co/%s/resolve/main/%s?download=true'",part,e->repo,e->file);
+    printf("[coder] fetching %s/%s (%lld MB, no token)...\n",e->repo,e->file,e->size/1000000);
+    if(system(cmd)!=0){ printf("[coder] download failed\n"); remove(part); return 1; }
+    if(stat(part,&st)!=0){ printf("[coder] download produced no file\n"); return 1; }
+    if((long long)st.st_size!=e->size){ printf("[coder] size mismatch (%lld != %lld); discarding\n",(long long)st.st_size,e->size); remove(part); return 1; }
+    if(jd_sha256_file(part,hex)!=0 || strcmp(hex,e->sha)!=0){ printf("[coder] sha256 mismatch; refusing unverified coder\n"); remove(part); return 1; }
+    if(rename(part,dest)!=0){ printf("[coder] finalize failed\n"); remove(part); return 1; }
+    printf("[coder] verified + resident: %s\n",dest); snprintf(out_path,out_sz,"%s",dest); return 0;
+}
+
 static int sample(float *logits, int V, float temp, int top_k) {
     if (temp <= 0) { int b = 0; for (int i = 1; i < V; i++) if (logits[i] > logits[b]) b = i; return b; }
     for (int i = 0; i < V; i++) logits[i] /= temp;
@@ -3760,6 +3843,7 @@ int main(int argc, char **argv) {
             printf("  --personality   path to personality.txt for finetuning\n");
             printf("  --pages N       HuggingFace pages to download (auto-sized to depth)\n");
             printf("  --host GGUF     index a model and generate through it (LoRA parliament)\n");
+            printf("  --coder KEY    fetch + keep a resident Qwen2.5-Coder GGUF (1.5b|3b|7b), run via host\n");
             printf("  --ask \"PROMPT\"  prompt for --host generation (default: a sample)\n");
             printf("  --rope-neox    force NeoX RoPE pairing (for arch=llama GGUFs laid out NeoX)\n");
             printf("  --rope-norm    force NORM RoPE pairing (override the arch heuristic)\n\n");
@@ -3772,13 +3856,19 @@ int main(int argc, char **argv) {
     /* Host-chat mode: --host <gguf> [--ask "prompt"] — index a model and generate through it
      * with the LoRA parliament live. Early-exit, bypasses the trainer entirely. */
     {
-        const char *host_path = NULL, *ask = "The capital of France is", *learn_file = NULL;
+        const char *host_path = NULL, *ask = "The capital of France is", *learn_file = NULL, *coder_key = NULL;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--host") == 0 && i+1 < argc) host_path = argv[++i];
+            else if (strcmp(argv[i], "--coder") == 0 && i+1 < argc) coder_key = argv[++i];
             else if (strcmp(argv[i], "--ask") == 0 && i+1 < argc) ask = argv[++i];
             else if (strcmp(argv[i], "--learn") == 0 && i+1 < argc) learn_file = argv[++i];
             else if (strcmp(argv[i], "--rope-neox") == 0) g_rope_override = 0;
             else if (strcmp(argv[i], "--rope-norm") == 0) g_rope_override = 1;
+        }
+        char coder_path[512] = {0};
+        if (coder_key) {
+            if (fetch_coder_gguf(coder_key, coder_path, sizeof(coder_path)) != 0) return 1;
+            if (!host_path) host_path = coder_path;   /* carry the resident coder; run it through the host path */
         }
         if (host_path) {
             printf("\n  m.c — host index mode. the parliament modulates the host.\n");
