@@ -519,9 +519,11 @@ static void matvec(float*out,float*W,float*x,int r,int co){
     for(int i=0;i<r;i++){float s=0;float*row=W+i*co;for(int j=0;j<co;j++)s+=row[j]*x[j];out[i]=s;}
 #endif
 }
+static long g_mvt_calls=0, g_mmt_calls=0;   /* JD_PROF profiler: per-step matvec_t / mm_fwd_t call counts */
 static void jd_mv(float*,const float*,int,const float*,int,int);  /* fwd-decl: packed inline-dequant matvec, defined below */
 /* matvec with GPU weight cache — W stays on GPU between calls */
 static void matvec_t(float*out,Tensor*W,float*x,int r,int co){
+    g_mvt_calls++;
     if (W->packed) { jd_mv(out,(const float*)W->packed,W->dtype,x,r,co); return; }  /* quantized weight: inline dequant, no f32 blow-up */
 #ifdef USE_CUBLAS
     cublas_init();
@@ -558,6 +560,7 @@ static void mm_fwd(float*C,float*A,float*B,int M,int N,int K){
 }
 /* mm_fwd with GPU weight cache — B (weight tensor) stays on GPU */
 static void mm_fwd_t(float*C,float*A,Tensor*B,int M,int N,int K){
+    g_mmt_calls++;
 #ifdef USE_CUBLAS
     cublas_init();
     float *dB=gpu_ensure(B->data, B->size, &B->d_data, &B->gpu_dirty);
@@ -580,7 +583,8 @@ static void mm_bwd(float*dA,float*dB,float*dC,float*A,float*B,int M,int N,int K)
     cudaMemcpy(ddC, dC, szMN, cudaMemcpyHostToDevice);
     cudaMemcpy(d_other, B, szNK, cudaMemcpyHostToDevice);
     cudaMemcpy(d_dA, dA, szMK, cudaMemcpyHostToDevice);
-    cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, K, M, N, &a, d_other, N, ddC, N, &b1, d_dA, K);
+    /* dA[M,K] += dC[M,N]·B[N,K] (row-major): col-major C^T = B^T·A^T → OP_N,OP_N, B(lda=K), dC(lda=N) */
+    cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, K, M, N, &a, d_other, K, ddC, N, &b1, d_dA, K);
     cudaMemcpy(dA, d_dA, szMK, cudaMemcpyDeviceToHost);
     cudaMemcpy(d_other, A, szMK, cudaMemcpyHostToDevice);
     cudaMemcpy(d_dA, dB, szNK, cudaMemcpyHostToDevice);
@@ -601,10 +605,10 @@ static void mm_bwd_t(float*dA,float*dB_data,float*dC,float*A,Tensor*B,int M,int 
     float *d_B=gpu_ensure(B->data, B->size, &B->d_data, &B->gpu_dirty);
     float *ddC=gpu_scratch(0,szMN), *d_dA=gpu_scratch(1,szMK>szNK?szMK:szNK);
     float a=1,b1=1;
-    /* dA[M,K] += dC[M,N] * B[N,K] */
+    /* dA[M,K] += dC[M,N]·B[N,K] (row-major): col-major C^T = B^T·A^T → OP_N,OP_N, B(lda=K), dC(lda=N) */
     cudaMemcpy(ddC, dC, szMN, cudaMemcpyHostToDevice);
     cudaMemcpy(d_dA, dA, szMK, cudaMemcpyHostToDevice);
-    cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, K, M, N, &a, d_B, N, ddC, N, &b1, d_dA, K);
+    cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, K, M, N, &a, d_B, K, ddC, N, &b1, d_dA, K);
     cudaMemcpy(dA, d_dA, szMK, cudaMemcpyDeviceToHost);
     /* dB[N,K] += dC^T * A */
     float *d_other=gpu_scratch(2,szMK);
@@ -1074,23 +1078,54 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
         rn_fwd(la->ffn_xn, s->residual, lw->ffn_norm->data, T, D, c->norm_eps);
         memset(la->moe_out, 0, T*D*4);
 
+        /* ─── Election first (unchanged: parliament_elect mutates consensus/election_count,
+         *     so run the exact per-token pass before any batching) ─── */
         for (int t = 0; t < T; t++) {
             float *xn_t = la->ffn_xn + t*D;
             int *ti = la->top_idx + t * MAX_EXPERTS;
             float *tw = la->top_wt + t * MAX_EXPERTS;
             int k = parliament_elect(&lw->parliament, lw->experts, xn_t, D, &s->hs, ti, tw);
             la->top_k[t] = k;
-
+        }
+        /* ─── Token-gather MoE: per expert, gather its routed tokens, ONE batched gemm per
+         *     projection (gate/up/down) via mm_fwd_t, scatter activations back into ea[t][ki]
+         *     (so backward is unchanged). Replaces ~T·k·3 per-token matvec_t with ~alive·3. ─── */
+        {
+            int e_cnt[MAX_EXPERTS] = {0};
+            for (int t = 0; t < T; t++) for (int ki = 0; ki < la->top_k[t]; ki++) e_cnt[la->top_idx[t*MAX_EXPERTS+ki]]++;
+            float *Xe = malloc((size_t)T*D*4), *gate_e = malloc((size_t)T*H*4), *up_e = malloc((size_t)T*H*4);
+            float *act_e = malloc((size_t)T*H*4), *down_e = malloc((size_t)T*D*4);
+            int *e_t = malloc((size_t)T*sizeof(int)), *e_ki = malloc((size_t)T*sizeof(int));
+            if (!(Xe && gate_e && up_e && act_e && down_e && e_t && e_ki)) { fprintf(stderr, "[fatal] MoE forward gather OOM\n"); exit(1); }
+            if (Xe && gate_e && up_e && act_e && down_e && e_t && e_ki) {
+                for (int e = 0; e < MAX_EXPERTS; e++) {
+                    if (!lw->experts[e].alive || e_cnt[e] == 0) continue;   /* n_e=0 → skip gemm */
+                    int n = 0;   /* gather rows routed to expert e (row order = token-major, ki-minor) */
+                    for (int t = 0; t < T; t++) for (int ki = 0; ki < la->top_k[t]; ki++)
+                        if (la->top_idx[t*MAX_EXPERTS+ki] == e) { e_t[n] = t; e_ki[n] = ki; memcpy(Xe + (size_t)n*D, la->ffn_xn + t*D, D*4); n++; }
+                    Expert *exp = &lw->experts[e];
+                    mm_fwd_t(gate_e, Xe, exp->w_gate, n, H, D);
+                    mm_fwd_t(up_e,   Xe, exp->w_up,   n, H, D);
+                    for (int r = 0; r < n; r++) for (int i = 0; i < H; i++) act_e[(size_t)r*H+i] = silu_f(gate_e[(size_t)r*H+i]) * up_e[(size_t)r*H+i];
+                    mm_fwd_t(down_e, act_e, exp->w_down, n, D, H);
+                    for (int r = 0; r < n; r++) {   /* scatter into ea[t][ki] for backward */
+                        ExpertAct *ea = &la->ea[e_t[r]*MAX_EXPERTS + e_ki[r]];
+                        memcpy(ea->gate_pre, gate_e + (size_t)r*H, H*4);
+                        memcpy(ea->up_pre,   up_e   + (size_t)r*H, H*4);
+                        memcpy(ea->act_out,  act_e  + (size_t)r*H, H*4);
+                        memcpy(ea->proj_out, down_e + (size_t)r*D, D*4);
+                    }
+                }
+            }
+            free(Xe); free(gate_e); free(up_e); free(act_e); free(down_e); free(e_t); free(e_ki);
+        }
+        /* moe_out accumulation in original per-token ki-order → exact FP parity with pre-batch code */
+        for (int t = 0; t < T; t++) {
+            int k = la->top_k[t]; float *mo = la->moe_out + t*D;
+            float *tw = la->top_wt + t * MAX_EXPERTS;
             for (int ki = 0; ki < k; ki++) {
-                int eI = ti[ki]; float eW = tw[ki];
-                Expert *exp = &lw->experts[eI];
-                ExpertAct *ea = &la->ea[t * MAX_EXPERTS + ki];
-                matvec_t(ea->gate_pre, exp->w_gate, xn_t, H, D);
-                matvec_t(ea->up_pre, exp->w_up, xn_t, H, D);
-                for (int i = 0; i < H; i++) { float act = silu_f(ea->gate_pre[i]); ea->act_out[i] = act * ea->up_pre[i]; }
-                matvec_t(ea->proj_out, exp->w_down, ea->act_out, D, H);
-                float *mo = la->moe_out + t*D;
-                for (int i = 0; i < D; i++) mo[i] += eW * ea->proj_out[i];
+                float eW = tw[ki]; float *po = la->ea[t*MAX_EXPERTS+ki].proj_out;
+                for (int i = 0; i < D; i++) mo[i] += eW * po[i];
             }
         }
         /* Aux loss: load balancing across experts */
@@ -1204,53 +1239,63 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
             aux_frac[la->top_idx[tt*MAX_EXPERTS+kki]] += la->top_wt[tt*MAX_EXPERTS+kki]; }
         for (int e = 0; e < MAX_EXPERTS; e++) aux_frac[e] /= (float)T;
 
-        /* Expert backward — per token, per selected expert */
+        /* Expert backward — BATCHED per expert (token-gather); replaces ~T·k per-token loops.
+         * Same math via mm_bwd (dA+=dC@B, dB+=dC^T@A): da=DMe@w_down, dw_down+=DMe^T@hid;
+         * dgate/dup via silu; dxe=dgate@w_gate+dup@w_up; dw_gate/up+=d*^T@Xe. egi<0 → discard weight grad. */
+        {
+            int be_cnt[MAX_EXPERTS] = {0};
+            for (int t = 0; t < T; t++) for (int ki = 0; ki < la->top_k[t]; ki++) be_cnt[la->top_idx[t*MAX_EXPERTS+ki]]++;
+            float *DMe = malloc((size_t)T*D*4), *Xe = malloc((size_t)T*D*4), *hid = malloc((size_t)T*H*4);
+            float *da = malloc((size_t)T*H*4), *dgt = malloc((size_t)T*H*4), *dupb = malloc((size_t)T*H*4), *dxe = malloc((size_t)T*D*4);
+            size_t dbmax = (size_t)H*D; float *sdB = malloc(dbmax*4);
+            int *b_t = malloc((size_t)T*sizeof(int)), *b_ki = malloc((size_t)T*sizeof(int));
+            if (!(DMe && Xe && hid && da && dgt && dupb && dxe && sdB && b_t && b_ki)) { fprintf(stderr, "[fatal] MoE backward gather OOM\n"); exit(1); }
+            if (DMe && Xe && hid && da && dgt && dupb && dxe && sdB && b_t && b_ki) {
+                memset(sdB, 0, dbmax*4);
+                for (int e = 0; e < MAX_EXPERTS; e++) {
+                    if (!lw->experts[e].alive || be_cnt[e] == 0) continue;   /* n=0 → skip gemm */
+                    Expert *exp = &lw->experts[e]; int egi = expert_gi[l][e];
+                    int n = 0;   /* gather rows routed to expert e (token-major, ki-minor) */
+                    for (int t = 0; t < T; t++) for (int ki = 0; ki < la->top_k[t]; ki++)
+                        if (la->top_idx[t*MAX_EXPERTS+ki] == e) {
+                            b_t[n] = t; b_ki[n] = ki;
+                            float eW = la->top_wt[t*MAX_EXPERTS+ki]; float *dm = dmo + t*D;
+                            for (int i = 0; i < D; i++) DMe[(size_t)n*D+i] = eW * dm[i];   /* DMe = eW·dm */
+                            memcpy(Xe  + (size_t)n*D, la->ffn_xn + t*D, D*4);
+                            memcpy(hid + (size_t)n*H, la->ea[t*MAX_EXPERTS+ki].act_out, H*4);   /* hid = silu(gate)·up (from fwd) */
+                            n++;
+                        }
+                    /* down: da += DMe@w_down ; dw_down += DMe^T@hid */
+                    memset(da, 0, (size_t)n*H*4);
+                    mm_bwd(da, (egi>=0)?g[egi+2]:sdB, DMe, hid, exp->w_down->data, n, D, H);
+                    /* element-wise dgate/dup */
+                    for (int r = 0; r < n; r++) {
+                        ExpertAct *ea = &la->ea[b_t[r]*MAX_EXPERTS + b_ki[r]];
+                        for (int i = 0; i < H; i++) {
+                            float gp = ea->gate_pre[i];
+                            dgt[(size_t)r*H+i]  = da[(size_t)r*H+i] * ea->up_pre[i] * silu_bwd(gp);
+                            dupb[(size_t)r*H+i] = da[(size_t)r*H+i] * silu_f(gp);
+                        }
+                    }
+                    /* gate+up: dxe += dgate@w_gate + dup@w_up ; dw_gate/up += d*^T@Xe */
+                    memset(dxe, 0, (size_t)n*D*4);
+                    mm_bwd(dxe, (egi>=0)?g[egi]:sdB,   dgt,  Xe, exp->w_gate->data, n, H, D);
+                    mm_bwd(dxe, (egi>=0)?g[egi+1]:sdB, dupb, Xe, exp->w_up->data,   n, H, D);
+                    /* scatter dx → dfxn */
+                    for (int r = 0; r < n; r++) { int t = b_t[r]; float *dxr = dxe + (size_t)r*D;
+                        for (int j = 0; j < D; j++) s->dfxn[t*D+j] += dxr[j]; }
+                }
+            }
+            free(DMe); free(Xe); free(hid); free(da); free(dgt); free(dupb); free(dxe); free(sdB); free(b_t); free(b_ki);
+        }
+
+        /* Variable-k parliament + aux backward — per token (cheap k×k Jacobian, unchanged) */
         for (int t = 0; t < T; t++) {
             int k = la->top_k[t];
             int *ti = la->top_idx + t * MAX_EXPERTS;
             float *tw = la->top_wt + t * MAX_EXPERTS;
             float *dm = dmo + t*D;
             float *xn_t = la->ffn_xn + t*D;
-
-            for (int ki = 0; ki < k; ki++) {
-                int eI = ti[ki]; float eW = tw[ki];
-                Expert *exp = &lw->experts[eI];
-                ExpertAct *ea = &la->ea[t * MAX_EXPERTS + ki];
-                int egi = expert_gi[l][eI]; /* grad index for this expert's w_gate */
-
-                /* dw_down + da (hidden grad) — merged single pass */
-                float *da = calloc(H, 4);
-                float *hid = NULL;
-                if (egi >= 0) {
-                    hid = calloc(H, 4);
-                    for (int j = 0; j < H; j++) hid[j] = silu_f(ea->gate_pre[j]) * ea->up_pre[j];
-                }
-                for (int i = 0; i < D; i++) {
-                    float dp = eW * dm[i];
-                    for (int j = 0; j < H; j++) {
-                        da[j] += dp * exp->w_down->data[i*H+j];
-                        if (hid) g[egi+2][i*H+j] += dp * hid[j];
-                    }
-                }
-                if (hid) free(hid);
-
-                /* dgate, dup → dw_gate, dw_up */
-                for (int i = 0; i < H; i++) {
-                    float gp = ea->gate_pre[i], up = ea->up_pre[i];
-                    float gd = silu_bwd(gp); float act = silu_f(gp);
-                    float dg = da[i] * up * gd, du = da[i] * act;
-                    /* dx (input gradient) */
-                    for (int j = 0; j < D; j++) s->dfxn[t*D+j] += dg * exp->w_gate->data[i*D+j] + du * exp->w_up->data[i*D+j];
-                    /* Expert weight gradients — accumulated into correct g[] slots */
-                    if (egi >= 0) {
-                        for (int j = 0; j < D; j++) {
-                            g[egi][i*D+j] += dg * xn_t[j];     /* dw_gate */
-                            g[egi+1][i*D+j] += du * xn_t[j];   /* dw_up */
-                        }
-                    }
-                }
-                free(da);
-            }
 
             /* ═══ Variable-k parliament backward (CRITICAL) ═══
              * softmax Jacobian is k_t × k_t for this token.
@@ -4323,6 +4368,8 @@ int main(int argc, char **argv) {
                    chuck.dampen, chuck.sigma,
                    cal_drift.drift, cal_drift.stability,
                    eph.expert_temperature, eph.active_layers, el);
+            if (getenv("JD_PROF")) fprintf(stderr, "[prof] since last log: matvec_t=%ld mm_fwd_t=%ld  (T=%d depth=%d batch=%d)\n", g_mvt_calls, g_mmt_calls, c.seq_len, c.depth, c.batch_size);
+            g_mvt_calls = 0; g_mmt_calls = 0;
             rl = 0; lc = 0;
             /* Expert load distribution (from last forward pass) */
             for (int l = 0; l < c.depth; l++) {
