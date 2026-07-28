@@ -594,7 +594,7 @@ static void mm_bwd(float*dA,float*dB,float*dC,float*A,float*B,int M,int N,int K)
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, K, N, 1.0f, dC, N, B, K, 1.0f, dA, K);
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, N, K, M, 1.0f, dC, N, A, K, 1.0f, dB, K);
 #else
-    for(int m=0;m<M;m++){float*dc=dC+m*N,*am=A+m*K;for(int n=0;n<N;n++){float d=dc[n];if(d==0)continue;float*bn=B+n*K;for(int k=0;k<K;k++){dA[m*K+k]+=d*bn[k];dB[n*K+k]+=d*am[k];}}}
+    for(int m=0;m<M;m++){float*dc=dC+m*N,*am=A+m*K;for(int n=0;n<N;n++){float d=dc[n];float*bn=B+n*K;for(int k=0;k<K;k++){dA[m*K+k]+=d*bn[k];dB[n*K+k]+=d*am[k];}}}
 #endif
 }
 /* mm_bwd with GPU weight cache — B (weight tensor) stays on GPU */
@@ -988,6 +988,7 @@ static TrainState alloc_ts(Config *c) {
     s.dq = calloc(T*qd, 4); s.dk = calloc(T*kv, 4); s.dv = calloc(T*kv, 4);
     s.dao = calloc(T*qd, 4); s.dfxn = calloc(T*D, 4);
     s.dhb = calloc(T*H, 4); s.dhb2 = calloc(T*H, 4); s.deo = calloc(T*D, 4);
+    s.final_n = calloc(T*D, 4); s.logits = calloc(T*c->vocab_size, 4);
     int half = c->head_dim / 2;
     s.cos_c = calloc(T*half, 4); s.sin_c = calloc(T*half, 4);
     for (int p = 0; p < T; p++) for (int i = 0; i < half; i++) {
@@ -1141,8 +1142,8 @@ static float train_fwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *ta
         for (int i = 0; i < T*D; i++) s->residual[i] += la->moe_out[i];
     }
 
-    s->final_n = calloc(T*D, 4); rn_fwd(s->final_n, s->residual, w->output_norm->data, T, D, c->norm_eps);
-    s->logits = calloc(T * c->vocab_size, 4); mm_fwd_t(s->logits, s->final_n, w->output, T, c->vocab_size, D);
+    rn_fwd(s->final_n, s->residual, w->output_norm->data, T, D, c->norm_eps);
+    mm_fwd_t(s->logits, s->final_n, w->output, T, c->vocab_size, D);
 
     float loss = 0; int nv = 0;
     for (int t = 0; t < T; t++) {
@@ -1167,10 +1168,10 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
     int D = c->dim, kv = c->n_kv_heads * c->head_dim, qd = c->n_heads * c->head_dim;
     int hd = c->head_dim, H = c->hidden_dim, hg = c->n_heads / c->n_kv_heads, V = c->vocab_size;
     float sc = 1.0f / sqrtf((float)hd);
-    int *layer_gi = NULL;
-    int nv = 0; for (int t = 0; t < T; t++) if (targets[t] >= 0) nv++;
-    if (nv == 0) goto done;
-    float inv_n = 1.0f / (float)nv;
+        int *layer_gi = NULL;
+        int nv = 0; for (int t = 0; t < T; t++) if (targets[t] >= 0) nv++;
+        if (nv == 0) goto done;
+        float inv_n = 1.0f / (float)nv;
 
     /* d_logits — cross entropy backward */
     float *dl = calloc(T*V, 4);
@@ -1399,7 +1400,6 @@ static void train_bwd(ModelW *w, Config *c, TrainState *s, int *tokens, int *tar
     for (int t = 0; t < T; t++) { float *de = g[0] + tokens[t]*D; float *dr = s->dr + t*D; for (int i = 0; i < D; i++) de[i] += dr[i]; }
 done:
     free(layer_gi);
-    free(s->logits); s->logits = NULL; free(s->final_n); s->final_n = NULL;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -1491,11 +1491,17 @@ static void update_vitality(LayerW *lw, Config *c, int total_tokens) {
     lw->n_alive = n_alive;
 }
 
-static int try_mitosis(LayerW *lw, Config *c) {
+static int try_mitosis(LayerW *lw, Config *c, float mitosis_eagerness) {
     /* Find overloaded expert with high vitality */
     int n_alive = 0;
     for (int e = 0; e < MAX_EXPERTS; e++) if (lw->experts[e].alive) n_alive++;
     if (n_alive >= MAX_EXPERTS) return 0;
+
+    /* Ephemeral eagerness lowers the age threshold (10..20). eagerness=0.5 → 20,
+     * eagerness=1.0 → 10. Replaces the old hack that overwrote every expert's age. */
+    int age_threshold = 20 - (int)(10.0f * (mitosis_eagerness - 0.5f));
+    if (age_threshold < 10) age_threshold = 10;
+    if (age_threshold > 20) age_threshold = 20;
 
     int parent = -1; float best_score = -1e9f;
     for (int e = 0; e < MAX_EXPERTS; e++) {
@@ -1503,7 +1509,7 @@ static int try_mitosis(LayerW *lw, Config *c) {
         Expert *exp = &lw->experts[e];
         /* overloaded (high vitality) + old enough; among those, split the most GENERALIST
          * (highest vitality, lowest specialization) — specialists are preserved, not cloned. */
-        if (exp->vitality > 0.8f && exp->age >= 20) {
+        if (exp->vitality > 0.8f && exp->age >= age_threshold) {
             float score = exp->vitality - exp->specialization;
             if (score > best_score) { best_score = score; parent = e; }
         }
@@ -4253,29 +4259,26 @@ int main(int argc, char **argv) {
         /* Compute ephemeral config BEFORE life/death decisions */
         EphemeralConfig eph_pre = ephemeral_compute(&tok_eye, &parser_eye, &ts.hs,
                                                      w.layers[0].parliament.consensus, &meta, &cal_drift, c.depth);
-        c.active_depth = eph_pre.active_layers;   /* this step's dynamic depth — consumed by the inference forward */
         c.vitality_threshold = eph_pre.vitality_threshold;   /* ephemeral apoptosis cutoff */
         for (int _pl = 0; _pl < c.depth; _pl++) w.layers[_pl].parliament.temperature = eph_pre.expert_temperature;
         for (int l = 0; l < c.depth; l++) {
-            /* Count tokens routed to each expert this step */
+            /* Count tokens routed to each expert this step.
+             * total_routed = sum_t k_t (not seq_len!) — each token routes to k_t
+             * experts, so fair_share must be total_routed / n_alive, not seq_len / n_alive.
+             * The old code passed seq_len, inflating ratio by k_avg (2-4x), which pinned
+             * every expert's vitality to 1.0 and froze the population. */
             LayerAct *la = &ts.layers[l];
+            int total_routed = 0;
             for (int t = 0; t < c.seq_len; t++) {
                 int k = la->top_k[t];
+                total_routed += k;
                 for (int ki = 0; ki < k; ki++) {
                     int eI = la->top_idx[t * MAX_EXPERTS + ki];
                     if (eI >= 0 && eI < MAX_EXPERTS) w.layers[l].experts[eI].tokens_seen++;
                 }
             }
-            update_vitality(&w.layers[l], &c, c.seq_len);
-            /* Ephemeral modulation: mitosis eagerness affects birth threshold */
-            if (eph_pre.mitosis_eagerness > 0.6f) {
-                /* Lower the age requirement when system wants more experts */
-                int saved_age = 20;
-                for (int e = 0; e < MAX_EXPERTS; e++)
-                    if (w.layers[l].experts[e].alive && w.layers[l].experts[e].age >= 10 + (int)(10 * (1.0f - eph_pre.mitosis_eagerness)))
-                        w.layers[l].experts[e].age = saved_age; /* let them through */
-            }
-            if (try_mitosis(&w.layers[l], &c)) {
+            update_vitality(&w.layers[l], &c, total_routed);
+            if (try_mitosis(&w.layers[l], &c, eph_pre.mitosis_eagerness)) {
                 total_births++;
                 if ((step+1) % c.log_every == 0) printf("  [birth] layer %d: expert born (total alive: %d)\n", l, w.layers[l].n_alive);
             }
@@ -4294,10 +4297,6 @@ int main(int argc, char **argv) {
         /* Mark topology changed if birth/death happened — rebuild at start of next step */
         int step_births = total_births - prev_births, step_deaths = total_deaths - prev_deaths;
         if (step_births > 0 || step_deaths > 0) topology_changed = 1;
-
-        /* ═══ EPHEMERAL CONFIG ═══ */
-        EphemeralConfig eph = ephemeral_compute(&tok_eye, &parser_eye, &ts.hs,
-                                                 w.layers[0].parliament.consensus, &meta, &cal_drift, c.depth);
 
         /* ═══ META-LEARNING TRACK ═══ */
         if ((step+1) % (c.log_every * 2) == 0) {
@@ -4367,7 +4366,7 @@ int main(int argc, char **argv) {
                    w.layers[0].parliament.consensus,
                    chuck.dampen, chuck.sigma,
                    cal_drift.drift, cal_drift.stability,
-                   eph.expert_temperature, eph.active_layers, el);
+                   eph_pre.expert_temperature, eph_pre.active_layers, el);
             if (getenv("JD_PROF")) fprintf(stderr, "[prof] since last log: matvec_t=%ld mm_fwd_t=%ld  (T=%d depth=%d batch=%d)\n", g_mvt_calls, g_mmt_calls, c.seq_len, c.depth, c.batch_size);
             g_mvt_calls = 0; g_mmt_calls = 0;
             rl = 0; lc = 0;
